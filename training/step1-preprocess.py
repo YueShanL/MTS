@@ -27,7 +27,7 @@ def separate_song(audio, sr, export: str = None, target=None, modelName="umxl"):
     return separated
 
 
-# TODO: implements below functions. target: highlight mainstream melody in vocal music
+# alternative methods
 def vocal_to_note(audio, export: str = None, ):
     return
 
