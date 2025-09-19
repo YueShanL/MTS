@@ -1,13 +1,24 @@
-import ast
 import os
 import json
+import os
+
 import pandas as pd
-from datasets import Dataset, DatasetDict, load_dataset
-from huggingface_hub import hf_hub_download
+from datasets import DatasetDict, Dataset
 
 
-def load_piast_dataset(repo_path="./dataset/PIAST/"):  # --- 加载 piast-at ---
+def load_piast_dataset(repo_path="./dataset/PIAST/", download_if_empty=False):  # --- 加载 piast-at ---
     global Dataset
+
+    try:
+        if (not os.path.isdir(repo_path) or len(os.listdir(repo_path)) == 0) and download_if_empty:
+            from git import Repo, GitCommandError
+            if not os.path.isdir(repo_path): os.makedirs(repo_path)
+            print("downloading dataset")
+            Repo.clone_from("https://huggingface.co/datasets/Hayeonbang/PIAST", repo_path)
+    except Exception as e:
+        print(f'unable to download piast dataset to {repo_path} because: {e}')
+        return
+
     try:
         # 构建数据集
         dataset_dict = {}
