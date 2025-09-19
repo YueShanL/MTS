@@ -1,21 +1,22 @@
-import os
-from itertools import chain
+import ast
+import json
+import re
+import time
+from datetime import datetime
+from fuzzywuzzy import fuzz, process
 
 import pandas as pd
+from google import genai
+from google.genai import types
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import requests
-import song_name_extractor
-import time
-import json
-from datetime import datetime
 from utils.config import getAPIValue
 
 
 class YouTubePianoCoverDataset:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.youtube = build('youtube', 'v3', developerKey=api_key)
+    def __init__(self, youtube_api, google_llm_api):
+        self.youtube = build('youtube', 'v3', developerKey=youtube_api)
+        self.client = genai.Client(api_key=google_llm_api)
         self.dataset = []
 
     def search_piano_covers(self, query, max_results=50, result_per_search=50):
@@ -105,13 +106,82 @@ class YouTubePianoCoverDataset:
 
         return self.dataset
 
-    def extract_original_title(self, csv_file_path):
+    def extract_name(self, titles, time_delay=0.1):
+        contents = f'you are a music collection assistant, please extract the EXACT music name without adding any ' \
+                   f'authors\' name from the following video titles, considering carefully about the music name words and ' \
+                   f'formats. return in List format:{titles}'
+        # print(contents)
+
+        response = self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_budget=0)  # Disables thinking
+            ),
+        )
+        cleaned_text = re.sub(r'^[^\[]*|[^\]]*$', '', response.text)
+        print(cleaned_text)
+        time.sleep(time_delay)
+        return ast.literal_eval(cleaned_text)
+
+    def extract_original_title(self, csv_file_path, overwrite=False, batch_size=50, similarity_threshold=0.7):
         df = pd.read_csv(csv_file_path)
+        start_idx = 0
+        names = []
+
+        if not overwrite and 'original_song' in df.columns:
+            non_empty_mask = df['original_song'].notna() & (df['original_song'] != '')
+            if non_empty_mask.any():
+                start_idx = non_empty_mask.sum()
+                names = list(df['original_song'])[0:start_idx]
+                print(f"starting from {start_idx}")
 
         titles = df['cover_title']
-        titles_split = [titles[i:i + 50] for i in range(0, len(titles), 50)]
-        names = [song_name_extractor.extract_name(titles_split[i]) for i in range(0, len(titles_split))]
-        names = list(chain.from_iterable(names))
+        if len(titles) == start_idx: return
+        titles_split = [titles[i:i + batch_size] for i in range(start_idx, len(titles), batch_size)]
+
+        try:
+            for batch_idx, batch_titles in enumerate(titles_split):
+                # 提取当前批次的名称
+                extracted_names = self.extract_name(batch_titles)
+
+                # 处理每个提取的名称
+                batch_results = []
+                retire_list = []
+                for i, (original_title, extracted_name) in enumerate(zip(batch_titles, extracted_names)):
+                    # check availability
+                    if not extracted_name or pd.isna(extracted_name):
+                        batch_results.append(pd.NA)
+                        continue
+
+                    # add to matching list
+                    retire_list.append(extracted_name)
+
+                    failed = False
+                    # using edit distance, check all failed name before corresponding pair,
+                    # remove matched name and everything before it
+                    for n in retire_list:
+                        similarity = fuzz.partial_ratio(n.lower(), original_title.lower())
+
+                        # test similarity
+                        if (similarity / 100) >= similarity_threshold:
+                            failed = False
+                            batch_results.append(extracted_name)
+                            # clean everything before the success matching
+                            retire_list = retire_list[retire_list.index(n) + 1:]
+                            print(f"matched: '{n}' -> '{original_title}' (similarity: {similarity}%)")
+                            continue
+                        else:
+                            failed = True
+                            print(f"failed: '{n}' -> '{original_title}' (similarity: {similarity}%)")
+
+                    if failed:
+                        batch_results.append(pd.NA)
+
+                names.extend(batch_results)
+        except Exception as e:
+            print(f"error when communicating with LLM {e} \n saving solved work...")
+            pass
         print(names)
 
         name_df = pd.DataFrame(names, columns=['original_song'])
