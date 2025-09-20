@@ -2,6 +2,7 @@ import os
 import random
 
 import pretty_midi
+import torch
 from audiocraft.data.audio import audio_write
 from audiocraft.models import MusicGen
 
@@ -18,7 +19,7 @@ styles = ['Pop', 'Synth-pop', 'Dance Pop', 'Pop Rock', 'Electropop', 'Hip-Hop', 
 a_model = MusicGen.get_pretrained('facebook/musicgen-melody-large')
 
 
-def generate(source_path, tag: str, output_path, repeating_limit=1, model=a_model, time_limit=-1):
+def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit=1, model=a_model, time_limit=-1, split_audio=0):
     file_name = os.path.splitext(os.path.basename(source_path))[0]
     i = 0
     for f in os.listdir(output_path):
@@ -42,13 +43,39 @@ def generate(source_path, tag: str, output_path, repeating_limit=1, model=a_mode
             visualize=False,
         )
 
+        audio_segments = []
+        if split_audio:
+            segment_samples = int(time_limit * sr)
+            total_samples = len(audio_tensor)
+            num_segments = min(total_samples // segment_samples, split_audio)
+
+            for i in range(num_segments):
+                start_idx = i * segment_samples
+                end_idx = start_idx + segment_samples
+                segment = audio_tensor[start_idx:end_idx]
+                audio_segments.append(segment.expand(1, -1))
+
+            print(f"split into {len(audio_segments)} audios")
+        else:
+            audio_tensor = audio_tensor[:int(sr*duration)]
+
         model.set_generation_params(duration=duration)  # generate 8 seconds.
         style = random.choice(styles)
-        while f'{file_name}_{style}.wav' in os.listdir(output_path):
-            st = style
-            style = random.choice(styles)
-            print(f'{file_name}_{st}.wav already exist, trying {style}')
+        if not fix_style:
+            while f'{file_name}_{style}.wav' in os.listdir(output_path):
+                st = style
+                style = random.choice(styles)
+                print(f'{file_name}_{st}.wav already exist, trying {style}')
+        else:
+            style = fix_style
         prompt = f'{style}, {tag}'
         # generates using the melody from the given audio and the provided descriptions.
-        wav, token = model.generate_with_chroma([prompt], audio_tensor[None].expand(1, -1, -1), sr, return_tokens=True)
-        audio_write(f'{output_path}/{file_name}_{style}', wav[0].cpu(), model.sample_rate, strategy="loudness", loudness_compressor=True)
+        if split_audio:
+            wav = model.generate_with_chroma([prompt] * len(audio_segments), audio_segments, sr)
+            for idx, w in enumerate(wav):
+                audio_write(f'{output_path}/{file_name}_part{idx}_{style}', w[0].cpu(), model.sample_rate, strategy="loudness",
+                            loudness_compressor=True)
+        else:
+            wav, token = model.generate_with_chroma([prompt], audio_tensor.expand(1, -1, -1), sr, return_tokens=True)
+            audio_write(f'{output_path}/{file_name}_{style}', wav[0].cpu(), model.sample_rate, strategy="loudness",
+                        loudness_compressor=True)
