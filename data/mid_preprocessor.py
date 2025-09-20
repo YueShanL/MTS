@@ -57,19 +57,14 @@ def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
             if debug:
                 print(f"使用SoundFont合成音频: {soundfont_path}")
 
-            try:
-                # 使用fluidsynth合成音频
-                import fluidsynth
-                sf = fluidsynth.Synth()
-                sf.start()
+            # 使用fluidsynth合成音频
+            import fluidsynth
+            sf = fluidsynth.Synth()
+            sf.start()
 
-                # 合成音频
-                audio_signal = midi_data.fluidsynth(fs=sr, sf2_path=soundfont_path)
+            # 合成音频
+            audio_signal = midi_data.fluidsynth(fs=sr, sf2_path=soundfont_path)
 
-            except ImportError:
-                print("警告: 未安装fluidsynth，使用内置合成器")
-                print("请运行: pip install pyfluidsynth")
-                audio_signal = midi_data.synthesize(fs=sr)
         else:
             if debug and soundfont_path:
                 print(f"警告: SoundFont文件不存在: {soundfont_path}，使用内置合成器")
