@@ -1,5 +1,5 @@
 from data.loader import load_piast_dataset
-debug = 1
+debug = 0
 
 if __name__ == '__main__':
     dataset = load_piast_dataset(repo_path="../data/dataset/PIAST", download_if_empty=True)
@@ -31,4 +31,4 @@ if __name__ == '__main__':
         from data.generator import generate
 
         for path, text in zip(source_path, tag):
-            generate(path, text, output_path)
+            generate(path, text, output_path, time_limit=1800, split_audio=10)
