@@ -53,7 +53,7 @@ def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit
                 start_idx = i * segment_samples
                 end_idx = start_idx + segment_samples
                 segment = audio_tensor[start_idx:end_idx]
-                audio_segments.append(segment.expand(1, -1))
+                audio_segments.append(segment[None].expand(1, -1, -1))
 
             print(f"split into {len(audio_segments)} audios")
         else:
@@ -72,10 +72,11 @@ def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit
         # generates using the melody from the given audio and the provided descriptions.
         if split_audio:
             for idx, audio in enumerate(audio_segments):
+                print(f'generating {file_name}_part{idx}_{style}.wav')
                 wav = model.generate_with_chroma([prompt], audio, sr)
                 audio_write(f'{output_path}/{file_name}_part{idx}_{style}', wav[0].cpu(), sr, strategy="loudness",
                             loudness_compressor=True)
         else:
-            wav, token = model.generate_with_chroma([prompt], audio_tensor.expand(1, -1, -1), sr, return_tokens=True)
+            wav, token = model.generate_with_chroma([prompt], audio_tensor[None].expand(1, -1, -1), sr, return_tokens=True)
             audio_write(f'{output_path}/{file_name}_{style}', wav[0].cpu(), model.sample_rate, strategy="loudness",
                         loudness_compressor=True)

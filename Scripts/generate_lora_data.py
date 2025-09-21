@@ -20,7 +20,7 @@ if __name__ == '__main__':
 
         # source_path = subset[0]['midi_path']
         # tag = str(subset[0]['text'])
-        print(subset[:10])
+        # print(subset[:10])
 
         from data.generator import generate
 
@@ -29,7 +29,7 @@ if __name__ == '__main__':
                  output_path,
                  repeating_limit=1,
                  fix_style="Rock",
-                 time_limit=1800,
+                 time_limit=30,
                  split_audio=10)
 
     else:
