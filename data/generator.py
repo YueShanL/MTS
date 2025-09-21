@@ -47,13 +47,16 @@ def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit
         if split_audio:
             segment_samples = int(time_limit * sr)
             total_samples = len(audio_tensor)
-            num_segments = min(total_samples // segment_samples, split_audio)
+            num_segments = min((total_samples // segment_samples) + 1, split_audio)
+            end_idx = 0
 
             for i in range(num_segments):
                 start_idx = i * segment_samples
                 end_idx = start_idx + segment_samples
                 segment = audio_tensor[start_idx:end_idx]
                 audio_segments.append(segment[None].expand(1, -1, -1))
+
+            audio_segments.append(audio_tensor[end_idx:][None].expand(1, -1, -1))
 
             print(f"split into {len(audio_segments)} audios")
         else:

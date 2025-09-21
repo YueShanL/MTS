@@ -4,9 +4,11 @@ from data.loader import load_piast_dataset
 
 debug = 0
 continue_on_exception = 1
+linux = 1
 if __name__ == '__main__':
-    dataset = load_piast_dataset(repo_path="../data/dataset/PIAST", download_if_empty=True)
-    output_path = "../output/Lora/training/"
+    dataset = load_piast_dataset(repo_path="data/dataset/PIAST", download_if_empty=True) if linux \
+        else load_piast_dataset(repo_path="../data/dataset/PIAST", download_if_empty=True)
+    output_path = "output/Lora/training/" if linux else "../output/Lora/training/"
     print(f'get dataset {dataset}')
 
     if debug:
@@ -41,7 +43,7 @@ if __name__ == '__main__':
 
         for path, text in zip(source_path, tag):
             try:
-                generate(path, text, output_path, time_limit=1800, split_audio=10)
+                generate(path, text, output_path, time_limit=1200, split_audio=10)
             except Exception as e:
                 print(f'failed on generating {os.path.basename(path)} because: {e}')
                 if continue_on_exception: continue
