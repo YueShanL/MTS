@@ -2,7 +2,6 @@ import os
 import random
 
 import pretty_midi
-import torch
 from audiocraft.data.audio import audio_write
 from audiocraft.models import MusicGen
 
@@ -12,10 +11,9 @@ styles = ['Pop', 'Synth-pop', 'Dance Pop', 'Pop Rock', 'Electropop', 'Hip-Hop', 
           'Drill', 'Emo Rap', 'Rock', 'Punk Rock', 'Alternative Rock', 'Indie Rock', 'Hard Rock', 'Electronic', 'EDM',
           'House', 'Techno', 'Trance', 'Dubstep', 'J-Pop', 'R&B', 'Soul', 'Contemporary R&B', 'Neo-Soul', 'Funk',
           'Country', 'Traditional Country', 'Pop Country', 'Country Rock', 'Jazz', 'Swing', 'Bebop', 'Cool Jazz',
-          'Fusion',
-          'Classical', 'Baroque', 'Romantic', 'Modern Classical', 'Metal', 'Heavy Metal', 'Death Metal', 'Black Metal',
-          'Metalcore', 'Folk', 'Traditional Folk', 'Contemporary Folk', 'Folk Rock', 'Latin', 'Reggaeton', 'Salsa',
-          'Bachata', 'Latin Pop', 'K-Pop', 'Blues', 'Delta Blues', 'Chicago Blues', 'Electric Blues', 'World']
+          'Fusion', 'Classical', 'Baroque', 'Romantic', 'Modern Classical', 'Metal', 'Heavy Metal', 'Death Metal',
+          'Black Metal', 'Metalcore', 'Folk', 'Traditional Folk', 'Contemporary Folk', 'Folk Rock', 'Latin', 'Reggaeton',
+          'Salsa', 'Bachata', 'Latin Pop', 'K-Pop', 'Blues', 'Delta Blues', 'Chicago Blues', 'Electric Blues', 'World']
 a_model = MusicGen.get_pretrained('facebook/musicgen-melody-large')
 
 
@@ -47,7 +45,7 @@ def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit
         if split_audio:
             segment_samples = int(time_limit * sr)
             total_samples = len(audio_tensor)
-            num_segments = min((total_samples // segment_samples) + 1, split_audio)
+            num_segments = min(total_samples // segment_samples, split_audio)
             end_idx = 0
 
             for i in range(num_segments):

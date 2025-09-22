@@ -30,8 +30,8 @@ if __name__ == '__main__':
                  tag,
                  output_path,
                  repeating_limit=1,
-                 fix_style="Rock",
-                 time_limit=30,
+                 #fix_style="Rock",
+                 time_limit=600,
                  split_audio=10)
 
     else:
@@ -43,7 +43,7 @@ if __name__ == '__main__':
 
         for path, text in zip(source_path, tag):
             try:
-                generate(path, text, output_path, time_limit=1200, split_audio=10)
+                generate(path, text, output_path, time_limit=1000, split_audio=10)
             except Exception as e:
                 print(f'failed on generating {os.path.basename(path)} because: {e}')
                 if continue_on_exception: continue

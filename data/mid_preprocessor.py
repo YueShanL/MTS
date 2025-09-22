@@ -5,9 +5,6 @@ import torch
 import os
 from pathlib import Path
 
-from audiocraft.data.audio import audio_write
-
-
 def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
                         debug=False, debug_dir="debug_output", save_audio=False,
                         visualize=False, normalize=True, soundfont_path=None):
