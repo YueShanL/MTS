@@ -8,7 +8,6 @@ from regex import regex
 
 
 def load_piast_dataset(repo_path="./dataset/PIAST/", download_if_empty=False):  # --- 加载 piast-at ---
-    global Dataset
 
     try:
         if (not os.path.isdir(repo_path) or len(os.listdir(repo_path)) == 0) and download_if_empty:
