@@ -4,7 +4,7 @@ from pathlib import Path
 import soundfile as sf
 
 from data.loader import load_piast_dataset
-from data.mid_preprocessor import midi_to_audio_tensor
+from utils.mid_preprocessor import midi_to_audio_tensor
 
 dataset = load_piast_dataset(repo_path="../data/dataset/PIAST")
 output_path = "./output/"

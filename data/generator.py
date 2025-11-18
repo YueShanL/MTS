@@ -5,7 +5,7 @@ import pretty_midi
 from audiocraft.data.audio import audio_write
 from audiocraft.models import MusicGen
 
-from data.mid_preprocessor import midi_to_audio_tensor
+from utils.mid_preprocessor import midi_to_audio_tensor
 
 styles = ['Pop', 'Synth-pop', 'Dance Pop', 'Pop Rock', 'Electropop', 'Hip-Hop', 'Rap', 'Boom-Bap', 'Trap', 'Jazz Rap',
           'Drill', 'Emo Rap', 'Rock', 'Punk Rock', 'Alternative Rock', 'Indie Rock', 'Hard Rock', 'Electronic', 'EDM',
@@ -60,7 +60,7 @@ def generate(source_path, tag: str, output_path, fix_style=None, repeating_limit
         else:
             audio_tensor = audio_tensor[:int(sr*duration)]
 
-        model.set_generation_params(duration=duration)  # generate 8 seconds.
+        model.set_generation_params(duration=duration)
         style = random.choice(styles)
         if not fix_style:
             while f'{file_name}_{style}.wav' in os.listdir(output_path):

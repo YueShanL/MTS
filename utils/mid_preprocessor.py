@@ -138,8 +138,8 @@ def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
 
 
 if __name__ == "__main__":
-    file_name = "7iPSSj62CUw.mid"
-    soundfont_path = "..\\asset\\GeneralUser-GS.sf2"
+    file_name = "../data/7iPSSj62CUw.mid"
+    soundfont_path = "../asset/GeneralUser-GS.sf2"
     # 将MIDI文件转换为音频张量
     # 启用调试模式
     audio_tensor, sr = midi_to_audio_tensor(
