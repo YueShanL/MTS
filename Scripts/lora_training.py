@@ -12,8 +12,8 @@ debug = 0
 continue_on_exception = 1
 linux = 1
 if __name__ == '__main__':
-    dataset_path = "/output/Lora/dataset" if linux else "../output/Lora/dataset"
-    generated_audio_dir = "/output/Lora/training" if linux else "../output/Lora/training"
+    dataset_path = "output/Lora/dataset" if linux else "../output/Lora/dataset"
+    generated_audio_dir = "output/Lora/training" if linux else "../output/Lora/training"
     output_path = "output/Lora/adaptor/checkpoints/" if linux else "../output/Lora/adaptor/checkpoints/"
 
     generating_dataset = False

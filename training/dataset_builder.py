@@ -164,7 +164,7 @@ def load_audio_dataset(piast_data, generated_audio_dir):
     return dataset
 
 
-def process_style_transfer_dataset(dataset: Dataset):
+def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"):
     """
     处理风格转换数据集，添加音频编码
     """
@@ -216,78 +216,14 @@ def process_style_transfer_dataset(dataset: Dataset):
     # 应用处理函数
     processed_dataset = dataset.sort(column_names='part_index').map(
         process_example,
-        remove_columns=dataset.column_names
+        remove_columns=dataset.column_names,
+        cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
+        writer_batch_size=10,  # 控制写入批次大小
+        #load_from_cache_file=False,  # 强制重新处理
     )
 
     return processed_dataset
 
-
-def create_style_transfer_data_loader(dataset, batch_size=2, shuffle=True):
-    """
-    创建风格转换数据加载器
-    """
-
-    def collate_fn(batch):
-        batch = [b for b in batch if b is not None]
-        if len(batch) == 0:
-            return None
-
-        # 获取最大长度
-        max_length = max(len(item["input_ids"]) for item in batch)
-
-        # 填充序列
-        input_ids = []
-        attention_mask = []
-        input_audio_values = []
-        target_audio_values = []
-        texts = []
-        styles = []
-        input_ids_list = []
-
-        for item in batch:
-            # 填充 input_ids
-            pad_length = max_length - len(item["input_ids"])
-            padded_input_ids = torch.cat([
-                item["input_ids"],
-                torch.zeros(pad_length, dtype=item["input_ids"].dtype)
-            ])
-            input_ids.append(padded_input_ids)
-
-            # 填充 attention_mask
-            padded_attention_mask = torch.cat([
-                item["attention_mask"],
-                torch.zeros(pad_length, dtype=item["attention_mask"].dtype)
-            ])
-            attention_mask.append(padded_attention_mask)
-
-            # 音频值（保持为列表）
-            input_audio_values.append(item["input_audio_values"])
-            target_audio_values.append(item["target_audio_values"])
-
-            texts.append(item["text"])
-            styles.append(item["style"])
-            input_ids_list.append(item["input_id"])
-
-        return {
-            "input_ids": torch.stack(input_ids),
-            "attention_mask": torch.stack(attention_mask),
-            "input_audio_values": input_audio_values,
-            "target_audio_values": target_audio_values,
-            "text": texts,
-            "style": styles,
-            "input_id": input_ids_list
-        }
-
-    # 创建数据加载器
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-
-    return dataloader
 
 if __name__ == '__main__':
     piast = load_piast_dataset('../data/dataset/PIAST/')
