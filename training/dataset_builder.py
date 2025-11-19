@@ -174,44 +174,49 @@ def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"
         # 加载参考音频
         input_waveform, input_sr = torchaudio.load(example["audio_path"])
 
-        # 转换为单声道
-        if input_waveform.shape[0] > 1:
-            input_waveform = torch.mean(input_waveform, dim=0, keepdim=True)
-        else:
-            input_waveform = input_waveform.unsqueeze(0)
+        try:
 
-        # 重采样
-        if input_sr != sample_rate:
-            resampler = torchaudio.transforms.Resample(input_sr, sample_rate)
-            input_waveform = resampler(input_waveform)
+            # 转换为单声道
+            if input_waveform.shape[0] > 1:
+                input_waveform = torch.mean(input_waveform, dim=0, keepdim=True)
+            else:
+                input_waveform = input_waveform.unsqueeze(0)
 
-        # 加载目标音频
-        soundfont_path = "../asset/GeneralUser-GS.sf2"
-        target_waveform, target_sr = midi_to_audio_tensor(example["original_path"], soundfont_path=soundfont_path)
+            # 重采样
+            if input_sr != sample_rate:
+                resampler = torchaudio.transforms.Resample(input_sr, sample_rate)
+                input_waveform = resampler(input_waveform)
 
+            # 加载目标音频
+            soundfont_path = "../asset/GeneralUser-GS.sf2"
+            target_waveform, target_sr = midi_to_audio_tensor(example["original_path"], soundfont_path=soundfont_path)
 
-        if example['part_index'] > 0:
-            print(
-                f'take {int(time[example["original_path"]])} to {int(time[example["original_path"]] + example["duration"] * input_sr)} with length {len(target_waveform)}')
-            target_waveform = target_waveform[time[example["original_path"]]: int(time[example["original_path"]] + example["duration"] * input_sr)]
-        else:
-            time[example["original_path"]] = 0
+            if example['part_index'] > 0:
+                print(
+                    f'take {int(time[example["original_path"]])} to {int(time[example["original_path"]] + example["duration"] * input_sr)} with length {len(target_waveform)}')
+                target_waveform = target_waveform[time[example["original_path"]]: int(
+                    time[example["original_path"]] + example["duration"] * input_sr)]
+            else:
+                time[example["original_path"]] = 0
 
-        target_waveform[None].expand(1, -1, -1)
+            target_waveform[None].expand(1, -1, -1)
 
-        time[example["original_path"]] += int(example["duration"] * input_sr)
+            time[example["original_path"]] += int(example["duration"] * input_sr)
 
-        # 重采样
-        if target_sr != sample_rate:
-            resampler = torchaudio.transforms.Resample(target_sr, sample_rate)
-            target_waveform = resampler(target_waveform)
+            # 重采样
+            if target_sr != sample_rate:
+                resampler = torchaudio.transforms.Resample(target_sr, sample_rate)
+                target_waveform = resampler(target_waveform)
 
+            return {
+                "input_audio_values": input_waveform.squeeze(),
+                "target_audio_values": target_waveform.squeeze(),
+                "text": example["text"],
+            }
 
-        return {
-            "input_audio_values": input_waveform.squeeze(),
-            "target_audio_values": target_waveform.squeeze(),
-            "text": example["text"],
-        }
+        except Exception as e:
+            print(f'failed to process {example} because: {e}')
+            return None
 
     # 应用处理函数
     processed_dataset = dataset.sort(column_names='part_index').map(
@@ -219,8 +224,8 @@ def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"
         remove_columns=dataset.column_names,
         cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
         writer_batch_size=10,  # 控制写入批次大小
-        #load_from_cache_file=False,  # 强制重新处理
-    )
+        # load_from_cache_file=False,  # 强制重新处理
+    ).filter(lambda example: example is None)
 
     return processed_dataset
 
