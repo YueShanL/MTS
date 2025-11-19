@@ -225,7 +225,7 @@ def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"
         cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
         writer_batch_size=10,  # 控制写入批次大小
         # load_from_cache_file=False,  # 强制重新处理
-    ).filter(lambda example: example is None)
+    ).filter(lambda example: example is not None)
 
     return processed_dataset
 
