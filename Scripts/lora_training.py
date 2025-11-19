@@ -25,7 +25,6 @@ if __name__ == '__main__':
         generating_dataset = True
 
     if generating_dataset:
-
         piast = load_piast_dataset(repo_path="data/dataset/PIAST", download_if_empty=True) if linux \
             else load_piast_dataset(repo_path="../data/dataset/PIAST", download_if_empty=True)
 

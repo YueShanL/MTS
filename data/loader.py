@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
-from datasets import DatasetDict
+from datasets import DatasetDict, Dataset
 from regex import regex
 
 
@@ -69,7 +69,6 @@ def load_piast_dataset(repo_path="./dataset/PIAST/", download_if_empty=False):  
                 at_data["midi_path"].append(midi_path if os.path.exists(midi_path) else "")
 
             # 创建数据集
-            from datasets import Dataset
             at_dataset = Dataset.from_dict(at_data)
             dataset_dict["piast-at"] = at_dataset
 
@@ -192,11 +191,9 @@ def load_out_dataset(repo_path="../output/Lora/training"):
                 print(f"警告: 文件名格式不匹配: {audio_file.name}")
 
         # 创建数据集
-        from datasets import Dataset
         dataset = Dataset.from_dict(dataset_data)
 
         # 创建 DatasetDict
-        from datasets import DatasetDict
         dataset_dict = DatasetDict({"train": dataset})
 
         print(f"成功加载 {len(dataset)} 个训练样本")
