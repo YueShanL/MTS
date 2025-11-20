@@ -111,7 +111,7 @@ class SimpleMusicGenLoRATrainer:
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
-            shuffle=shuffle,
+            #shuffle=shuffle,
             collate_fn=collate_fn,
         )
 
@@ -180,6 +180,8 @@ class SimpleMusicGenLoRATrainer:
             num_batches = 0
 
             for batch_idx, batch in enumerate(dataloader):
+                if batch_idx == 2001:
+                    break
                 if batch is None:
                     continue
 

@@ -3,7 +3,7 @@ from torch.utils.data import DataLoader
 
 from data.loader import load_piast_dataset
 from dataset_builder import load_audio_dataset, process_style_transfer_dataset
-from training.dataset import MusicGenMelodyDataset
+from training.dataset import MusicGenMelodyDataset, create_musicgen_dataset
 from training.lora import SimpleMusicGenLoRATrainer
 from transformers import AutoProcessor
 
@@ -27,8 +27,8 @@ def main():
 
     if debug: check_lora_dataset(dataset)
 
-    dataset = MusicGenMelodyDataset(
-        dataset['train'],
+    dataset = create_musicgen_dataset(
+        dataset['train'].to_iterable_dataset(),
         processor=AutoProcessor.from_pretrained('facebook/musicgen-melody')
     )
 

@@ -1,6 +1,6 @@
 import os.path
 
-from datasets import DatasetDict
+from datasets import DatasetDict, Dataset
 from transformers import AutoProcessor
 
 from data.loader import load_piast_dataset
@@ -33,12 +33,12 @@ if __name__ == '__main__':
             generated_audio_dir=generated_audio_dir
         )
 
-        data = process_style_transfer_dataset(data)
+        data = process_style_transfer_dataset(Dataset.from_dict(data[:210]))
 
         print(data.info)
         DatasetDict({"train": data}).save_to_disk(dataset_path)
     else:
-        data = dataset['train']
+        data = dataset['train'].to_iterable_dataset().filter(lambda example, idx: len(example['input_audio_values']) > 0, with_indices=True)
 
     trainer = SimpleMusicGenLoRATrainer(
         model_name='facebook/musicgen-melody',
@@ -48,12 +48,12 @@ if __name__ == '__main__':
         lora_dropout=0.1
     )
 
-    dataset = MusicGenMelodyDataset(
+    dataset = create_musicgen_dataset(
         data,
-        processor=AutoProcessor.from_pretrained('facebook/musicgen-melody')
+        processor=AutoProcessor.from_pretrained('facebook/musicgen-melody'),
     )
 
-    train_dataloader = trainer.create_dataloader(dataset)
+    train_dataloader = trainer.create_dataloader(dataset, batch_size=4)
     print(f'load dataset of size {train_dataloader.dataset.__len__()}')
 
     # 4. 开始训练
