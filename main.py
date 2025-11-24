@@ -1,9 +1,9 @@
 import os
+import soundfile as sf
 
+import torch
 import torchaudio
-from audiocraft.models import MusicGen
-from audiocraft.data.audio import audio_write
-
+from transformers import MusicgenMelodyForConditionalGeneration, AutoProcessor
 
 testSource = "./data/debug_output/"
 filename = '7iPSSj62CUw_audio.wav'
@@ -11,17 +11,25 @@ modelname = "umxl"
 'umxhq'
 
 
-model = MusicGen.get_pretrained('facebook/musicgen-melody-large')
-model.set_generation_params(duration=30, cfg_coef=3)  # generate 8 seconds.
-#wav = model.generate_unconditional(1)    # generates 4 unconditional audio samples
-#descriptions = ['happy rock', 'energetic EDM', 'sad jazz']
-#wav = model.generate(['guitar finger-style'])#descriptions)  # generates 3 samples.
+device = torch.device("cuda:0" if torch.cuda.device_count()>0 else "cpu")
 
-melody, sr = torchaudio.load(os.path.join(testSource, filename))
-prompt = ['solo, piano cover, rearrange']
-# generates using the melody from the given audio and the provided descriptions.
-wav, token = model.generate_with_chroma(['Jpop'], melody[None].expand(1, -1, -1), sr, return_tokens=True)
+repo_id = "ylacombe/musicgen-melody-punk-lora"
 
-for idx, one_wav in enumerate(wav):
-    # Will save under {idx}.wav, with loudness normalization at -14 db LUFS.
-    audio_write(f'{idx}', one_wav.cpu(), model.sample_rate, strategy="loudness", loudness_compressor=True)
+model = MusicgenMelodyForConditionalGeneration.from_pretrained("facebook/musicgen-melody", torch_dtype=torch.float32).to(device)
+#model = PeftModel.from_pretrained(model, repo_id).to(device)
+
+processor = AutoProcessor.from_pretrained("facebook/musicgen-melody")#config.base_model_name_or_path)
+
+wav, sr = torchaudio.load(os.path.join(testSource, filename))
+
+inputs = processor(
+    text=["80s punk and pop track with bassy drums and synth", "80s blues track with groovy saxophone"],
+    padding=True,
+    return_tensors="pt",
+).to(device)
+audio_values = model.generate(**inputs, do_sample=True, guidance_scale=3, max_new_tokens=256)
+
+sampling_rate = model.config.audio_encoder.sampling_rate
+audio_values = audio_values.cpu().numpy()
+sf.write("musicgen_out_0.wav", audio_values[0].T, sampling_rate)
+sf.write("musicgen_out_1.wav", audio_values[1].T, sampling_rate)

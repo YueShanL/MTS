@@ -71,7 +71,7 @@ class SimpleMusicGenLoRATrainer:
         except ValueError as e:
             print(f"LoRA 应用失败: {e}")
 
-    def create_dataloader(self, dataset, batch_size=1, shuffle=True):
+    def create_dataloader(self, dataset, batch_size=1):
         """
         创建数据加载器
         """

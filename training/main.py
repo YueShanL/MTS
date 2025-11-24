@@ -1,12 +1,9 @@
-from datasets import Dataset, DatasetDict
-from torch.utils.data import DataLoader
-
-from data.loader import load_piast_dataset
-from dataset_builder import load_audio_dataset, process_style_transfer_dataset
-from training.dataset import MusicGenMelodyDataset, create_musicgen_dataset
-from training.lora import SimpleMusicGenLoRATrainer
+import datasets
+from datasets import Features, Value, Sequence
 from transformers import AutoProcessor
 
+from training.dataset import create_musicgen_dataset
+from training.lora import SimpleMusicGenLoRATrainer
 from utils.debug import check_lora_dataset
 
 debug = False
@@ -23,17 +20,24 @@ def main():
 
     # piast = load_piast_dataset('../data/dataset/PIAST/')
 
-    dataset = DatasetDict.load_from_disk("../output/Lora/dataset")
+    features = Features({
+        'text': Value('string'),
+        'input_ids': Sequence(Value('int32')),
+        'attention_mask': Sequence(Value('int8')),
+        'input_audio_values': Sequence(Value('float32')),
+        'target_audio_values': Sequence(Value('float32'))
+    })
+
+    dataset = datasets.load_dataset(path="../output/Lora/dataset", features=features, split='train', streaming=True)
 
     if debug: check_lora_dataset(dataset)
 
     dataset = create_musicgen_dataset(
-        dataset['train'].to_iterable_dataset(),
+        dataset,
         processor=AutoProcessor.from_pretrained('facebook/musicgen-melody')
     )
 
     train_dataloader = trainer.create_dataloader(dataset)
-    print(f'load dataset of size {train_dataloader.dataset.__len__()}')
 
     # 4. 开始训练
     trainer.train(

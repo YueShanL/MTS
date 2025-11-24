@@ -160,6 +160,8 @@ class MusicGenMelodyIterableDataset(IterableDataset):
             if len(input_slice) < self.max_length:
                 pad_length = self.max_length - len(input_slice)
                 input_slice = np.pad(input_slice, (0, pad_length), mode='constant')
+            if len(target_slice) < self.max_length:
+                pad_length = self.max_length - len(target_slice)
                 target_slice = np.pad(target_slice, (0, pad_length), mode='constant')
 
             yield {
@@ -168,24 +170,6 @@ class MusicGenMelodyIterableDataset(IterableDataset):
                 'labels': Tensor(target_slice).unsqueeze(0),
                 'sample_rate': self.sampling_rate
             }
-
-    def __len__(self):
-        """
-        注意：IterableDataset通常没有确定的长度
-        这个方法只提供估计值，实际长度可能不同
-        """
-        try:
-            # 如果原始数据集有长度信息，尝试估计
-            total_length = 0
-            for example in self.dataset:
-                audio_length = len(example['input_audio_values'])
-                if audio_length > 0:
-                    num_slices = max(1, (audio_length - self.sliding_window) // self.step + 1)
-                    total_length += num_slices
-            return total_length
-        except:
-            # 如果无法计算长度，返回一个估计值或抛出异常
-            raise NotImplementedError("Cannot determine length for IterableDataset")
 
 
 def create_musicgen_dataset(

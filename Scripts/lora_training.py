@@ -1,16 +1,15 @@
-import os.path
-
-from datasets import DatasetDict, Dataset
+import datasets
+from datasets import DatasetDict, Dataset, Features, Value, Sequence, load_dataset
 from transformers import AutoProcessor
 
 from data.loader import load_piast_dataset
-from training.dataset import MusicGenMelodyDataset
+from training.dataset import create_musicgen_dataset
 from training.dataset_builder import load_audio_dataset, process_style_transfer_dataset
 from training.lora import SimpleMusicGenLoRATrainer
 
 debug = 0
 continue_on_exception = 1
-linux = 1
+linux = 0
 if __name__ == '__main__':
     dataset_path = "output/Lora/dataset" if linux else "../output/Lora/dataset"
     generated_audio_dir = "output/Lora/training" if linux else "../output/Lora/training"
@@ -19,7 +18,15 @@ if __name__ == '__main__':
     generating_dataset = False
 
     try:
-        dataset = DatasetDict.load_from_disk(dataset_path)
+        features = Features({
+            'text': Value('string'),
+            'input_ids': Sequence(Value('int32')),
+            'attention_mask': Sequence(Value('int8')),
+            'input_audio_values': Sequence(Value('float32')),
+            'target_audio_values': Sequence(Value('float32'))
+        })
+
+        dataset = load_dataset(path=dataset_path, features=features, split='train', streaming=True)
     except Exception as e:
         print(f'failed to load from {dataset_path}, trying to generate dataset')
         generating_dataset = True
@@ -37,8 +44,10 @@ if __name__ == '__main__':
 
         print(data.info)
         DatasetDict({"train": data}).save_to_disk(dataset_path)
+        data = data.to_iterable_dataset().filter(
+            lambda example, idx: len(example['input_audio_values']) > 0, with_indices=True)
     else:
-        data = dataset['train'].to_iterable_dataset().filter(lambda example, idx: len(example['input_audio_values']) > 0, with_indices=True)
+        data = dataset.filter(lambda example, idx: len(example['input_audio_values']) > 0, with_indices=True)
 
     trainer = SimpleMusicGenLoRATrainer(
         model_name='facebook/musicgen-melody',
@@ -54,12 +63,10 @@ if __name__ == '__main__':
     )
 
     train_dataloader = trainer.create_dataloader(dataset, batch_size=4)
-    print(f'load dataset of size {train_dataloader.dataset.__len__()}')
 
-    # 4. 开始训练
     trainer.train(
         dataloader=train_dataloader,
-        num_epochs=10,
+        num_epochs=7,
         learning_rate=1e-4,
     )
 
