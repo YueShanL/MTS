@@ -13,7 +13,7 @@ def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
 
     参数:
         midi_path (str): MIDI 文件的路径
-        sr (int): 采样率，默认为 22050
+        sr (int): 采样率，默认为 44100
         duration (float): 音频持续时间（秒），如果为None则使用MIDI文件的持续时间
         return_numpy (bool): 如果为True，返回numpy数组；否则返回PyTorch张量
         debug (bool): 是否启用调试模式

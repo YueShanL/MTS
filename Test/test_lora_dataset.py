@@ -1,0 +1,26 @@
+import random
+
+from datasets import Features, Value, Sequence, load_dataset
+import soundfile as sf
+
+debug = 0
+continue_on_exception = 1
+linux = 0
+if __name__ == '__main__':
+    dataset_path = "output/Lora/dataset" if linux else "../output/Lora/dataset"
+    generated_audio_dir = "output/Lora/training" if linux else "../output/Lora/training"
+    output_path = "Test/output/dataset_samples/lora/" if linux else "output/dataset_samples/lora/"
+
+    generating_dataset = False
+
+    features = Features({
+        'text': Value('string'),
+        'input_ids': Sequence(Value('int32')),
+        'attention_mask': Sequence(Value('int8')),
+        'input_audio_values': Sequence(Value('float32')),
+        'target_audio_values': Sequence(Value('float32'))
+    })
+
+    dataset = load_dataset(path=dataset_path, features=features, split='train')
+
+    sf.write(f"{output_path}out.wav",  dataset[random.randint(0, len(dataset) - 1)]['target_audio_values'], 32000)
