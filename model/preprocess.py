@@ -36,58 +36,82 @@ class NoteEmbedding(nn.Module):
         # 每根弦的技巧嵌入
         self.technique_embedding = nn.Embedding(config.num_techniques, self.per_string_embed_dim)
 
+        # 弦间注意力机制
+        self.string_attention = nn.MultiheadAttention(
+            embed_dim=self.per_string_embed_dim * 2,  # 品位+技巧的拼接维度
+            num_heads=4,  # 4个注意力头
+            batch_first=True,  # 批次维度在前
+            dropout=0.1  # 防止过拟合
+        )
+
+        # 注意力后的层归一化和前馈网络
+        self.norm1 = nn.LayerNorm(self.per_string_embed_dim * 2)
+        self.norm2 = nn.LayerNorm(self.per_string_embed_dim * 2)
+        self.ffn = nn.Sequential(
+            nn.Linear(self.per_string_embed_dim * 2, self.per_string_embed_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.per_string_embed_dim * 4, self.per_string_embed_dim * 2)
+        )
+
         # 计算总嵌入维度
         total_embed_dim = (
                 self.duration_embed_dim +  # duration: 128
-                self.per_string_embed_dim * config.num_strings +  # 所有弦的品位: 32*6=192
-                self.per_string_embed_dim * config.num_strings  # 所有弦的技巧: 32*6=192
+                self.per_string_embed_dim * config.num_strings * 2  # 注意力后的弦特征: 32*6*2=384
         )
 
         print(f"NoteEmbeddingSimple维度: total={total_embed_dim}, hidden_size={config.hidden_size}")
 
         # 线性层融合所有特征
-        self.feature_fusion = nn.Linear(total_embed_dim, config.hidden_size)
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(total_embed_dim, total_embed_dim * 2),
+            nn.ReLU(),
+            nn.Linear(total_embed_dim * 2, config.hidden_size)
+        )
 
     def forward(self, notes: Dict[str, torch.Tensor]) -> torch.Tensor:
         batch_size, seq_len = notes['duration'].shape
 
-        # 嵌入duration - 处理填充值（-100）
+        # 嵌入duration
         duration_indices = notes['duration'].long()
-        # 创建一个掩码，标记填充位置
         pad_mask = (duration_indices == -100)
-        # 将填充位置替换为0（临时，用于嵌入查找）
         duration_indices_clamped = duration_indices.clone()
         duration_indices_clamped[pad_mask] = 0
         duration_emb = self.duration_embedding(duration_indices_clamped)
-        # 将填充位置的嵌入置为零
         duration_emb[pad_mask] = 0.0
 
-        # 嵌入所有弦的品位并拼接
-        fret_emb_list = []
-        for s in range(self.config.num_strings):
-            fret_idx = notes['fret'][:, :, s].long()
-            pad_mask_fret = (fret_idx == -100)
-            fret_idx_clamped = fret_idx.clone()
-            fret_idx_clamped[pad_mask_fret] = 0
-            emb = self.fret_embedding(fret_idx_clamped)
-            emb[pad_mask_fret] = 0.0
-            fret_emb_list.append(emb)
-        fret_emb = torch.cat(fret_emb_list, dim=-1)
+        # 向量化处理所有弦的品位
+        # fret形状: [B, L, num_strings]
+        fret_indices = notes['fret'].long()  # [B, L, 6]
+        fret_pad_mask = (fret_indices == -100)
+        fret_indices_clamped = fret_indices.clone()
+        fret_indices_clamped[fret_pad_mask] = 0
 
-        # 嵌入所有弦的技巧并拼接
-        technique_emb_list = []
-        for s in range(self.config.num_strings):
-            tech_idx = notes['technique'][:, :, s].long()
-            pad_mask_tech = (tech_idx == -100)
-            tech_idx_clamped = tech_idx.clone()
-            tech_idx_clamped[pad_mask_tech] = 0
-            emb = self.technique_embedding(tech_idx_clamped)
-            emb[pad_mask_tech] = 0.0
-            technique_emb_list.append(emb)
-        technique_emb = torch.cat(technique_emb_list, dim=-1)
+        # 重塑为 [B*L*6] 以进行批量嵌入查找
+        fret_indices_flat = fret_indices_clamped.view(-1)
+        fret_emb_flat = self.fret_embedding(fret_indices_flat)  # [B*L*6, 32]
+        fret_emb = fret_emb_flat.view(batch_size, seq_len, self.config.num_strings, -1)  # [B, L, 6, 32]
+
+        # 将填充位置的嵌入置零
+        fret_emb[fret_pad_mask.unsqueeze(-1).expand_as(fret_emb)] = 0.0
+
+        # 展平弦维度 [B, L, 6*32]
+        fret_emb = fret_emb.view(batch_size, seq_len, -1)
+
+        # 向量化处理所有弦的技巧
+        tech_indices = notes['technique'].long()
+        tech_pad_mask = (tech_indices == -100)
+        tech_indices_clamped = tech_indices.clone()
+        tech_indices_clamped[tech_pad_mask] = 0
+
+        tech_indices_flat = tech_indices_clamped.view(-1)
+        tech_emb_flat = self.technique_embedding(tech_indices_flat)
+        tech_emb = tech_emb_flat.view(batch_size, seq_len, self.config.num_strings, -1)
+        tech_emb[tech_pad_mask.unsqueeze(-1).expand_as(tech_emb)] = 0.0
+        tech_emb = tech_emb.view(batch_size, seq_len, -1)
 
         # 拼接所有特征
-        combined = torch.cat([duration_emb, fret_emb, technique_emb], dim=-1)
+        combined = torch.cat([duration_emb, fret_emb, tech_emb], dim=-1)
 
         # 融合特征
         embeddings = self.feature_fusion(combined)
@@ -96,20 +120,23 @@ class NoteEmbedding(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    """位置编码"""
+    """绝对位置编码"""
 
-    def __init__(self, d_model, max_len=5000):
+    def __init__(self, hidden_size, max_position=512):
         super().__init__()
-        self.dropout = nn.Dropout(p=0.1)
+        self.position_embeddings = nn.Embedding(max_position, hidden_size)
+        self.max_position = max_position
 
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """为输入添加位置编码"""
+        batch_size, seq_len, hidden_size = x.shape
 
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
+        # 创建位置ID
+        position_ids = torch.arange(seq_len, device=x.device)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+        # 获取位置编码
+        position_embeddings = self.position_embeddings(position_ids)
+
+        # 添加到输入
+        return x + position_embeddings

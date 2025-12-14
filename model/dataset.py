@@ -1,63 +1,17 @@
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Generator
 
-import librosa
 import numpy as np
 import torch
 from guitarpro import Song, NoteEffect, Duration, Beat
 from torch import Tensor
-from transformers import Wav2Vec2Processor
+from torch.nn import functional
 
 from model.gp_utils import duration_to_idx, idx_to_duration
 from utils.GP5Generator import GuitarProGenerator, GuitarTechnique
 from utils.mid2gp import MIDItoGP5Converter
 from utils.mid_preprocessor import midi_to_audio_tensor
 
-
-class AudioProcessor:
-    """音频预处理工具类"""
-
-    def __init__(self, sample_rate=16000, max_duration=30):
-        self.sample_rate = sample_rate
-        self.max_duration = max_duration
-        self.max_samples = sample_rate * max_duration
-
-        # 加载Wav2Vec2处理器
-        self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
-
-    def load_and_preprocess(self, audio_path):
-        """加载并预处理音频文件"""
-        # 使用librosa加载音频
-        audio, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
-
-        # 标准化长度
-        if len(audio) > self.max_samples:
-            audio = audio[:self.max_samples]
-        elif len(audio) < self.max_samples:
-            # 填充静音
-            padding = np.zeros(self.max_samples - len(audio))
-            audio = np.concatenate([audio, padding])
-
-        # 转换为张量
-        audio_tensor = torch.from_numpy(audio).float()
-
-        # 使用Wav2Vec2处理器
-        inputs = self.processor(
-            audio_tensor,
-            sampling_rate=self.sample_rate,
-            return_tensors="pt"
-        )
-
-        return inputs.input_values.squeeze()
-
-    def extract_features(self, audio_tensor):
-        """提取音频特征"""
-        # 这里可以添加额外的音频特征提取
-        features = {
-            'waveform': audio_tensor,
-            'sr': self.sample_rate
-        }
-        return features
 
 class AudioGuitarTabDataset(torch.utils.data.Dataset):
     """音频到吉他谱数据集"""
@@ -66,7 +20,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
                  tab_data: List[Dict],  # 吉他谱数据
                  max_output_length: int = 128,
                  bpm: int = 120,
-                 sample_rate: int = 16000,
+                 sample_rate: int = 24000,
                  sliding_window: int = 10,
                  segment: int = 16,
                  context_len = 8,
@@ -97,18 +51,14 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         if len(self.slice_counts) == 0 and len(self.audio_inputs) != 0:
             self.init_cumulative_slices()
 
-        # Get raw data
-        slice_idx = 0
-        data_idx = 0
-        for i in range(len(self.cumulative_slices) - 1):
-            if self.cumulative_slices[i] <= idx < self.cumulative_slices[i + 1]:
-                data_idx = i
-                slice_idx = idx - self.cumulative_slices[i]
-                break
+        import bisect
+        # 找到第一个 >= idx 的位置，然后减1得到 data_idx
+        data_idx = bisect.bisect_right(self.cumulative_slices, idx) - 1
+        slice_idx = idx - self.cumulative_slices[data_idx]
 
         audio_length = len(self.audio_inputs[data_idx])
-        audio_start = min(slice_idx * (self.step + self.context_len) * self.sample_rate, audio_length)
-        audio_end = min(audio_start + self.segment * self.sample_rate, audio_length)
+        audio_start = slice_idx * self.step * self.sample_rate + self.context_len * self.sample_rate
+        audio_end = min(audio_start + (self.segment - self.context_len) * self.sample_rate, audio_length)
 
         input_audio = self.audio_inputs[data_idx][audio_start:audio_end]
 
@@ -127,19 +77,38 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
                 pad_width = [(0, 0)] * tab_data[key].ndim
                 pad_width[0] = (0, pad_length)
                 padded = np.pad(tab_data[key], pad_width, mode='constant')
-                tab_data[key] = Tensor(padded[self.context_len * self.bpm // 60 * 4:])
-                context_data[key] = Tensor(padded[:self.context_len * self.bpm // 60 * 4])
+                tab_data[key] = Tensor(padded[self.context_len * self.bpm // 60 * 4:]).to(torch.int64)
+                context_data[key] = Tensor(padded[:self.context_len * self.bpm // 60 * 4]).to(torch.int64)
 
         # padding
-        if len(input_audio) < self.segment * self.sample_rate:
-            pad_length = self.segment * self.sample_rate - len(input_audio)
-            input_audio = Tensor(np.pad(input_audio, (0, pad_length), mode='constant'))
+        if len(input_audio) < (self.segment - self.context_len) * self.sample_rate:
+            pad_length = (self.segment - self.context_len) * self.sample_rate - len(input_audio)
+            # 使用torch.nn.functional.pad，更高效且与后续流程兼容
+            input_audio = functional.pad(input_audio, (0, pad_length), mode='constant', value=0)
 
         return {
             'audio_input': input_audio,
             'context_notes': context_data,
             'target_notes': tab_data
         }
+
+    def stream_generator(self, start_idx: int = 0, end_idx: Optional[int] = None) -> Generator[Dict, None, None]:
+        """流式生成数据"""
+        if end_idx is None:
+            end_idx = len(self)
+
+        for idx in range(start_idx, end_idx):
+            yield self[idx]
+
+
+
+    def to(self, device):
+        for a in self.audio_inputs:
+            a.to(device)
+
+        for b in self.tab_data:
+            for c in b.values():
+                c.to(device)
 
     def init_cumulative_slices(self):
         self.dataset_len = min(self.max_len, len(self.audio_inputs))
@@ -171,13 +140,15 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         dataset = AudioGuitarTabDataset(audio_inputs, tab_data)
 
         convertor = MIDItoGP5Converter(GuitarProGenerator())
-
+        soundfont_path = "../asset/GeneralUser-GS.sf2"
         for idx, f in enumerate(midi_files):
             if idx >= limit:
                 break
             song = convertor.convert_midi_to_gp5(midi_path=f.__str__(), post_process=False)
-            tab_data.append(cls.encode_tab_sequence(dataset, song=song))
-            wav, _ = midi_to_audio_tensor(f.__str__(), dataset.sample_rate, None, False)
+            encoded = cls.encode_tab_sequence(dataset, song=song)
+            tab_data.append(encoded)
+            duration = len(encoded['duration']) / 8
+            wav, _ = midi_to_audio_tensor(f.__str__(), soundfont_path, dataset.sample_rate, duration, False)
             audio_inputs.append(wav)
 
         dataset.init_cumulative_slices()
@@ -340,7 +311,7 @@ def main():
 
     audio_inputs = []
     tab_data = []
-    dataset = AudioGuitarTabDataset(audio_inputs, tab_data, AudioProcessor())
+    dataset = AudioGuitarTabDataset(audio_inputs, tab_data)
     decoded = decode(tab_sequence, tempo = 120, post_process=False)
     result = dataset.encode_tab_sequence(decoded)
     duration_match = torch.all(duration == result['duration'])

@@ -5,9 +5,9 @@ import torch
 import os
 from pathlib import Path
 
-def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
+def midi_to_audio_tensor(midi_path, soundfont_path, sr=44100, duration=None, return_numpy=False,
                         debug=False, debug_dir="debug_output", save_audio=False,
-                        visualize=False, normalize=True, soundfont_path=None):
+                        visualize=False, normalize=True):
     """
     将 MIDI 文件转换为音频形式的张量，并提供调试选项
 
@@ -50,23 +50,18 @@ def midi_to_audio_tensor(midi_path, sr=44100, duration=None, return_numpy=False,
             duration = midi_duration
 
         # 使用SoundFont合成音频（如果提供了SoundFont路径）
-        if soundfont_path and os.path.exists(soundfont_path):
-            if debug:
-                print(f"使用SoundFont合成音频: {soundfont_path}")
+        #if soundfont_path and os.path.exists(soundfont_path):
+        if debug:
+            print(f"使用SoundFont合成音频: {soundfont_path}")
 
-            # 使用fluidsynth合成音频
-            import fluidsynth
-            sf = fluidsynth.Synth()
-            sf.start()
+        # 使用fluidsynth合成音频
+        import fluidsynth
+        sf = fluidsynth.Synth()
+        sf.start()
 
-            # 合成音频
-            audio_signal = midi_data.fluidsynth(fs=sr, sf2_path=soundfont_path)
+        # 合成音频
+        audio_signal = midi_data.fluidsynth(fs=sr, sf2_path=soundfont_path)
 
-        else:
-            if debug and soundfont_path:
-                print(f"警告: SoundFont文件不存在: {soundfont_path}，使用内置合成器")
-            # 使用内置合成器
-            audio_signal = midi_data.synthesize(fs=sr)
 
         # 确保音频信号长度正确
         expected_length = int(sr * duration)

@@ -1,15 +1,14 @@
 import random
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import guitarpro as gp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import Dataset
-from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig, EncodecModel
 from transformers import Wav2Vec2Model
 
 from model.dataset import decode, AudioGuitarTabDataset
@@ -22,13 +21,18 @@ class MTSGenConfig(PretrainedConfig):
 
     def __init__(
             self,
-            # 音频配置
-            audio_sample_rate=16000,
+            # 音频配置 - 变更为EnCodec常用采样率
+            audio_sample_rate=24000,  # 从16000改为24000
             audio_max_length=30,
             audio_channels=1,
 
-            # 编码器配置
-            encoder_model_name="facebook/wav2vec2-base-960h",
+            # 编码器配置 - 变更为EnCodec模型
+            encoder_model_name="facebook/encodec_24khz",
+
+            # EnCodec输出特征维度（编码器帧特征）
+            encoder_output_dim=128,
+            # 量化器数量（决定音频质量与特征复杂度）
+            num_quantizers=8,
 
             # Transformer配置
             hidden_size=512,
@@ -75,6 +79,10 @@ class MTSGenConfig(PretrainedConfig):
         # 编码器配置
         self.encoder_model_name = encoder_model_name
 
+        # EnCodec
+        self.encoder_output_dim = encoder_output_dim
+        self.num_quantizers = num_quantizers
+
         # Transformer配置
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -103,9 +111,6 @@ class MTSGenConfig(PretrainedConfig):
 
 
 
-
-
-
 # ============ 主模型 ============
 class MTSGen(PreTrainedModel):
 
@@ -116,12 +121,19 @@ class MTSGen(PreTrainedModel):
 
         # 音频编码器
         print(f"加载音频编码器: {config.encoder_model_name}")
-        self.audio_encoder = Wav2Vec2Model.from_pretrained(config.encoder_model_name)
-
+        self.audio_encoder = EncodecModel.from_pretrained(config.encoder_model_name)
+        # 固定编码器（如果配置要求）
         if config.freeze_encoder:
             for param in self.audio_encoder.parameters():
                 param.requires_grad = False
+        # =================================================
 
+        # ============ 修改：音频特征投影 ============
+        # EnCodec的编码器输出维度是固定的，我们需要从配置或模型中获取
+        # 假设我们使用最后一层量化器前的编码器帧特征，其维度为config.encoder_output_dim
+        # 如果该配置不存在，则使用一个常见值（例如128）
+        #encoder_hidden_size = getattr(config, 'encoder_output_dim', 128)
+        #self.audio_projection = nn.Linear(encoder_hidden_size, config.hidden_size)
         # 音频特征投影
         encoder_hidden_size = self.audio_encoder.config.hidden_size
         self.audio_projection = nn.Linear(encoder_hidden_size, config.hidden_size)
@@ -202,10 +214,46 @@ class MTSGen(PreTrainedModel):
             module.data.normal_(mean=0.0, std=0.02)
 
     def encode_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
-        """编码音频特征"""
+        """编码音频特征 - 适配EnCodec"""
         with torch.set_grad_enabled(not self.config.freeze_encoder):
-            audio_features = self.audio_encoder(audio_input).last_hidden_state
+            # ============ 方案一：使用编码器的连续特征（推荐） ============
+            # 这种方式与Wav2Vec2的输出最相似，都是连续特征
+            with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
+                # 直接调用编码器获取连续特征，而非使用encode()
+                # audio_input形状应为 [B, 1, T]
+                audio_features = self.audio_encoder.encoder(audio_input)
+
+                # EnCodec编码器输出形状为 [B, D, T]，需要转置为 [B, T, D]
+                if audio_features.dim() == 3:
+                    audio_features = audio_features.transpose(1, 2)
+
+            # 确保特征为浮点类型
+            audio_features = audio_features.float()
+            # ============================================================
+
+            # ============ 方案二：使用量化编码的嵌入（备选） ============
+            # 如果你想利用EnCodec的量化特性，可以这样处理：
+            # with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
+            #     # 获取量化编码
+            #     encoded_frames = self.audio_encoder.encode(audio_input)
+            #
+            #     # encoded_frames[0] 是编码列表，每个元素形状为 [B, K, T]
+            #     # 其中 K 是量化器数量，T 是时间步
+            #     if encoded_frames and len(encoded_frames[0]) > 0:
+            #         # 取最后一个量化器的编码（最高质量）
+            #         # 或者将所有量化器的编码取平均/拼接
+            #         codes = encoded_frames[0][-1]  # [B, 1, T]
+            #
+            #         # 需要为量化编码创建嵌入层（在__init__中定义）
+            #         # self.code_embedding = nn.Embedding(num_codebooks, encoder_output_dim)
+            #         audio_features = self.code_embedding(codes)  # [B, T, 1, D]
+            #         audio_features = audio_features.squeeze(2)   # [B, T, D]
+            # ============================================================
+
+            # 投影到模型隐藏维度
             audio_features = self.audio_projection(audio_features)
+
+            # 时间对齐适配
             return self.temporal_adapter(audio_features)
 
     def encode_notes(self, context_notes: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -215,13 +263,12 @@ class MTSGen(PreTrainedModel):
 
     def forward(
             self,
-
             audio_input: torch.Tensor,
             context_notes: Optional[Dict[str, torch.Tensor]] = None,
             target_notes: Optional[Dict[str, torch.Tensor]] = None,
             generate_length: Optional[int] = None,
             teacher_forcing: bool = True,
-            **kwargs
+            do_sample=True, **kwargs
     ) -> Dict[str, torch.Tensor]:
         """前向传播"""
         # 编码音频
@@ -239,7 +286,7 @@ class MTSGen(PreTrainedModel):
             return self._teacher_force_forward(memory, target_notes)
         else:
             generate_length = generate_length or self.config.notes_per_bar * self.config.predict_bars
-            return self._autoregressive_generate(memory, generate_length)
+            return self._autoregressive_generate(memory, generate_length, do_sample=do_sample)
 
     def _teacher_force_forward(self, memory: torch.Tensor, target_notes: Dict[str, torch.Tensor]) -> Dict[
         str, torch.Tensor]:
@@ -275,27 +322,38 @@ class MTSGen(PreTrainedModel):
         # 计算输出
         return self._compute_outputs(decoder_output)
 
-    def _autoregressive_generate(self, memory: torch.Tensor, generate_length: int) -> Dict[str, torch.Tensor]:
-        """自回归生成"""
+    def _autoregressive_generate(self, memory: torch.Tensor, generate_length: int,
+                                 do_sample=True) -> Dict[str, torch.Tensor]:
+        """修复后的自回归生成"""
         batch_size = memory.shape[0]
         device = memory.device
 
-        # 初始化生成序列
+        # 初始化生成序列（起始标记）
         current_input = self.start_token.expand(batch_size, 1, -1).to(device)
 
         # 存储生成结果
         all_outputs = {'duration': [], 'fret': [], 'technique': []}
 
         for step in range(generate_length):
+            # 为当前输入添加位置编码（只对当前步骤的序列）
+            # 注意：这里应该使用绝对位置编码，而不是每次都重新计算
+            seq_len = current_input.shape[1]
+
+            # 创建位置ID：0, 1, 2, ..., seq_len-1
+            position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
             # 添加位置编码
-            current_input_pe = self.positional_encoding(current_input)
+            current_input_with_pe = current_input + self.positional_encoding.position_embeddings(position_ids)
 
             # 创建因果掩码
-            seq_len = current_input_pe.shape[1]
             tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
 
             # 解码
-            decoder_output = self.autoregressive_decoder(current_input_pe, memory, tgt_mask)
+            decoder_output = self.autoregressive_decoder(
+                current_input_with_pe, memory, tgt_mask
+            )
+
+            # 取最后一个时间步的输出
             last_output = decoder_output[:, -1:, :]
             last_output = self.output_norm(last_output)
 
@@ -303,7 +361,11 @@ class MTSGen(PreTrainedModel):
             step_outputs = self._compute_outputs(last_output)
 
             # 采样下一个音符
-            next_note = self._sample_next_note(step_outputs)
+            next_note = self._sample_next_note(step_outputs, do_sample=do_sample)  # 离散值
+
+            # 将离散音符转换为嵌入向量，添加到输入序列
+            next_note_embedding = self._discrete_to_embedding(next_note)
+            current_input = torch.cat([current_input, next_note_embedding], dim=1)
 
             # 存储输出
             for key in all_outputs:
@@ -316,6 +378,23 @@ class MTSGen(PreTrainedModel):
                 outputs[key] = torch.cat(all_outputs[key], dim=1)
 
         return outputs
+
+    def _discrete_to_embedding(self, note_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """将离散音符转换为嵌入向量"""
+        # 创建一个包含所有时间步的字典（当前只有1个时间步）
+        batch_size = note_dict['duration'].shape[0]
+
+        # 扩展维度以匹配note_embedding的期望输入
+        discrete_notes = {}
+        for key in ['duration', 'fret', 'technique']:
+            if key in note_dict:
+                # note_dict[key] 形状: [B, 1] 或 [B, 1, num_strings]
+                discrete_notes[key] = note_dict[key]
+
+        # 通过note_embedding转换为嵌入向量
+        embedding = self.note_embedding(discrete_notes)  # [B, 1, hidden_size]
+
+        return embedding
 
     def _compute_outputs(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """计算各输出头"""
@@ -344,27 +423,84 @@ class MTSGen(PreTrainedModel):
             'technique': technique_output
         }
 
-    def _sample_next_note(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """采样下一个音符（贪婪采样）"""
+    def _sample_next_note(self, outputs: Dict[str, torch.Tensor],
+                          temperature: float = 0.5,
+                          top_k: int = 5,
+                          top_p: float = 0.9,
+                          do_sample: bool = True) -> Dict[str, torch.Tensor]:
+        """改进的采样策略（支持温度采样、top-k、top-p）"""
         sampled = {}
+        batch_size = outputs['duration'].shape[0]
+        device = outputs['duration'].device
 
         # 采样duration
         if 'duration' in outputs:
-            duration_probs = F.softmax(outputs['duration'], dim=-1)
-            sampled['duration'] = torch.argmax(duration_probs, dim=-1)
+            duration_logits = outputs['duration'] / max(temperature, 1e-8)
 
-        # 采样每根弦的品位
+            if do_sample:
+                # 应用top-k过滤
+                if top_k > 0:
+                    values, indices = torch.topk(duration_logits, min(top_k, duration_logits.shape[-1]), dim=-1)
+                    mask = torch.full_like(duration_logits, float('-inf'))
+                    mask.scatter_(-1, indices, values)
+                    duration_logits = mask
+
+                # 应用top-p过滤
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(duration_logits, descending=True, dim=-1)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+
+                    indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+                    duration_logits = duration_logits.masked_fill(indices_to_remove, float('-inf'))
+
+                # 多项式采样
+                probs = F.softmax(duration_logits, dim=-1)
+                sampled_duration = torch.multinomial(probs.view(-1, probs.shape[-1]), 1)
+                sampled_duration = sampled_duration.view(batch_size, -1)
+            else:
+                # 贪婪采样
+                sampled_duration = torch.argmax(duration_logits, dim=-1)
+
+            sampled['duration'] = sampled_duration
+
+        # 采样每根弦的品位（类似处理）
         if 'fret' in outputs:
-            fret_probs = F.softmax(outputs['fret'], dim=-1)
-            sampled['fret'] = torch.argmax(fret_probs, dim=-1)
+            fret_logits = outputs['fret'] / max(temperature, 1e-8)
 
-        # 采样每根弦的技巧
+            if do_sample:
+                # 对每根弦独立采样
+                batch_size, seq_len, num_strings, num_classes = fret_logits.shape
+                fret_logits_flat = fret_logits.view(batch_size * seq_len * num_strings, num_classes)
+
+                # 应用top-k和top-p（简化版）
+                probs_flat = F.softmax(fret_logits_flat, dim=-1)
+                sampled_fret_flat = torch.multinomial(probs_flat, 1)
+                sampled_fret = sampled_fret_flat.view(batch_size, seq_len, num_strings)
+            else:
+                sampled_fret = torch.argmax(fret_logits, dim=-1)
+
+            sampled['fret'] = sampled_fret
+
+        # 采样技巧（类似处理）
         if 'technique' in outputs:
-            tech_probs = F.softmax(outputs['technique'], dim=-1)
-            sampled['technique'] = torch.argmax(tech_probs, dim=-1)
+            tech_logits = outputs['technique'] / max(temperature, 1e-8)
+
+            if do_sample:
+                batch_size, seq_len, num_strings, num_classes = tech_logits.shape
+                tech_logits_flat = tech_logits.view(batch_size * seq_len * num_strings, num_classes)
+                probs_flat = F.softmax(tech_logits_flat, dim=-1)
+                sampled_tech_flat = torch.multinomial(probs_flat, 1)
+                sampled_tech = sampled_tech_flat.view(batch_size, seq_len, num_strings)
+            else:
+                sampled_tech = torch.argmax(tech_logits, dim=-1)
+
+            sampled['technique'] = sampled_tech
 
         # 如果duration=0，重置其他特征
-        mask = (sampled['duration'] == 0)
+        mask = (sampled['duration'] == 0).unsqueeze(-1).expand_as(sampled['fret'])
         if mask.any():
             sampled['fret'][mask] = self.fret_classes_per_string - 1  # 不演奏
             sampled['technique'][mask] = 0  # NORMAL
@@ -394,9 +530,9 @@ class AutoregressiveMultiTaskLoss(nn.Module):
             'fret': torch.ones(self.config.max_fret + 2),
             'technique': torch.ones(self.config.num_techniques)
         }
-        self.class_weights['duration'][0] = 0.3  # 无音符权重较低
-        self.class_weights['fret'][-1] = 0.3  # 不演奏状态权重较低
-        self.class_weights['technique'][0] = 0.3  # NORMAL技巧权重较低
+        self.class_weights['duration'][0] = 0.1  # 无音符权重较低
+        self.class_weights['fret'][-1] = 0.1  # 不演奏状态权重较低
+        #self.class_weights['technique'][0] = 0.3  # NORMAL技巧权重较低
 
     def forward(self, predictions, targets, device='cuda'):
         """计算损失"""
@@ -462,61 +598,62 @@ class AutoregressiveMultiTaskLoss(nn.Module):
 
 class MTSGenTrainer:
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, model = None):
         self.config = config or MTSGenConfig()
-        self.model = MTSGen(self.config)
+        self.model = model if model is not None else MTSGen(self.config)
         self.loss_fn = AutoregressiveMultiTaskLoss(self.config)
         self._setup_optimizer()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     @staticmethod
-    def collate_fn(batch):#, device='cuda'):
-        """
-        批处理函数，将多个样本组合成一个批次
-        """
-        # 初始化结果字典
+    def collate_fn(batch):
+        if not batch:
+            return {}
+
+        # 预先确定键，避免动态扩展字典（小幅优化）
+        first_sample = batch[0]
+        audio_list = []
+
+        # 预先分配列表，假设键固定为这三个
+        context_duration = []
+        context_fret = []
+        context_technique = []
+        target_duration = []
+        target_fret = []
+        target_technique = []
+
+        for sample in batch:
+            # 1. 音频数据
+            audio_list.append(sample['audio_input'])
+
+            # 2. 上下文数据 - 直接提取，假设结构固定
+            context_notes = sample['context_notes']
+            context_duration.append(context_notes['duration'])
+            context_fret.append(context_notes['fret'])
+            context_technique.append(context_notes['technique'])
+
+            # 3. 目标数据
+            target_notes = sample['target_notes']
+            target_duration.append(target_notes['duration'])
+            target_fret.append(target_notes['fret'])
+            target_technique.append(target_notes['technique'])
+
+        # 使用torch.stack一次性堆叠，减少碎片化操作
         batched = {
-            'audio_input': [],
-            'context_notes': {},
-            'target_notes': {}
+            'audio_input': torch.stack(audio_list).unsqueeze(1),  # [B, 1, T]
+            'context_notes': {
+                'duration': torch.stack(context_duration),
+                'fret': torch.stack(context_fret),
+                'technique': torch.stack(context_technique)
+            },
+            'target_notes': {
+                'duration': torch.stack(target_duration),
+                'fret': torch.stack(target_fret),
+                'technique': torch.stack(target_technique)
+            }
         }
 
-        # 首先遍历一次，收集所有的键
-        for sample in batch:
-            for key in sample['context_notes'].keys():
-                if key not in batched['context_notes']:
-                    batched['context_notes'][key] = []
-            for key in sample['target_notes'].keys():
-                if key not in batched['target_notes']:
-                    batched['target_notes'][key] = []
-
-        # 填充数据
-        for sample in batch:
-            # 处理音频输入
-            audio = torch.FloatTensor(sample['audio_input'])
-            batched['audio_input'].append(audio)
-
-            # 处理上下文音符
-            for key in batched['context_notes'].keys():
-                context_data = torch.LongTensor(sample['context_notes'][key])
-                batched['context_notes'][key].append(context_data)
-
-            # 处理目标音符
-            for key in batched['target_notes'].keys():
-                target_data = torch.LongTensor(sample['target_notes'][key])
-                batched['target_notes'][key].append(target_data)
-
-        # 堆叠所有张量
-        batched['audio_input'] = torch.stack(batched['audio_input'])
-
-        for key in batched['context_notes'].keys():
-            batched['context_notes'][key] = torch.stack(batched['context_notes'][key])
-
-        for key in batched['target_notes'].keys():
-            batched['target_notes'][key] = torch.stack(batched['target_notes'][key])
-
         return batched
-
 
     def _setup_optimizer(self):
         encoder_params = []
@@ -543,13 +680,13 @@ class MTSGenTrainer:
             self.optimizer, mode='min', patience=3, factor=0.5
         )
 
-    def train(self, dataset, batch_size = 16, num_epoch = 10, output_path = ''):
+    def train(self, dataset, batch_size = 8, num_epoch = 20, output_path = ''):
         """完整的训练循环"""
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(device)
         self.model.train()
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=self.collate_fn, pin_memory=True, num_workers=16)
+        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=self.collate_fn, pin_memory=True,shuffle=True, num_workers=8)
 
         avg_loss = 0
         for epoch in range(num_epoch):
@@ -564,6 +701,7 @@ class MTSGenTrainer:
 
                 loss = self.train_step(batch)
                 epoch_loss += loss
+
 
                 progress_bar.set_postfix({'loss': f'{loss:.4f}'})
 
@@ -597,6 +735,7 @@ class MTSGenTrainer:
             audio_input=audio_input,
             context_notes=context_notes,
             target_notes=target_notes,
+            do_sample=False,
             teacher_forcing=True
         )
 
@@ -617,9 +756,10 @@ class MTSGenTrainer:
 def main():
     """测试主函数"""
     config = MTSGenConfig(
-        hidden_size=512,
-        num_hidden_layers=4,
-        num_attention_heads=8,
+        hidden_size=1024,  # 增加隐藏层维度
+        num_hidden_layers=12,  # 增加层数
+        num_attention_heads=16,  # 增加头数，1024 ÷ 16 = 64
+        intermediate_size=4096,  # 增加前馈网络维度
         num_durations=13,
         num_techniques=14,
         context_bars=4,
@@ -630,25 +770,27 @@ def main():
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'checkpoint_epoch_5.pt')['model_state_dict'])
+    model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     dataset_path = "../output/Model/dataset"
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
-    dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
+    #dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
+    sample = dataset[random.randint(0, len(dataset) - 1)]
 
     # 测试数据
     batch_size = 1
-    audio_length = 16000 * 5
+    audio_length = 24000 * 8
     context_length = 64
 
     # 模拟音频输入
-    dummy_audio = dataset[random.randint(0, len(dataset) - 1)]['audio_input'][:audio_length].unsqueeze(0)
+    dummy_audio = torch.randn(batch_size,1, audio_length)
+    dummy_audio = sample['audio_input'][:audio_length].unsqueeze(0).unsqueeze(1)
     import soundfile as sf
 
-    sf.write(f"out.wav",  dummy_audio.squeeze().cpu().numpy(), 16000)
-    #torch.randn(batch_size, audio_length)
+    sf.write(f"out.wav",  dummy_audio.squeeze().cpu().numpy(), 24000)
+
 
     # 模拟上下文音符
     dummy_context = {
@@ -657,6 +799,7 @@ def main():
         'technique': torch.randint(0, 14, (batch_size, context_length, 6))
     }
 
+
     # 模拟目标音符
     target_length = 16
     dummy_target = {
@@ -664,9 +807,13 @@ def main():
         'fret': torch.randint(0, 26, (batch_size, target_length, 6)),
         'technique': torch.randint(0, 14, (batch_size, target_length, 6))
     }
+    dummy_target = {}
+    target = sample['target_notes']
+    for key, value in target.items():
+        dummy_target[key] = value[:64]
 
     # 测试teacher forcing模式
-    print("\n测试Teacher Forcing模式:")
+    '''print("\n测试Teacher Forcing模式:")
     outputs = model(
         audio_input=dummy_audio,
         context_notes=dummy_context,
@@ -676,7 +823,7 @@ def main():
 
     for key, value in outputs.items():
         if value is not None:
-            print(f"  {key}: {value.shape}")
+            print(f"  {key}: {value.shape}")'''
 
     # 测试生成模式
     print("\n测试生成模式:")
@@ -684,9 +831,10 @@ def main():
     with torch.no_grad():
         generate_outputs = model(
             audio_input=dummy_audio,
-            context_notes=dummy_context,
+            #context_notes=dummy_context,
             teacher_forcing=False,
-            generate_length=64
+            generate_length=64,
+            do_sample=True
         )
 
         for key, value in generate_outputs.items():
@@ -699,8 +847,12 @@ def main():
             sample[key] = value[0]
 
     song = decode(sample)
+    target = decode(dummy_target)
 
     gp.write(song, 'out.gp5')
+    gp.write(target, 'target.gp5')
+
+    print(song)
 
 
     '''# ============ 新增：损失计算案例 ============

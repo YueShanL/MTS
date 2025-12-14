@@ -39,7 +39,7 @@ class MIDItoGP5Converter:
     def _create_note_mappings(self) -> Dict[int, List[Tuple[int, int]]]:
         mappings = {}
 
-        for midi_note in range(40, 85):
+        for midi_note in range(40, 88):
             positions = []
             for string_idx, open_note in enumerate(self.tuning):
                 fret = midi_note - open_note
