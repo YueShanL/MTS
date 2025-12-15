@@ -209,8 +209,8 @@ def process_style_transfer_dataset(dataset: Dataset, generator = False, cache_di
                 target_waveform = resampler(target_waveform)
 
             return {
-                "input_audio_values": input_waveform.squeeze(),
-                "target_audio_values": target_waveform.squeeze(),
+                "input_audio_values": input_waveform.squeeze().tolist(),
+                "target_audio_values": target_waveform.squeeze().tolist(),
                 "text": example["text"],
             }
 

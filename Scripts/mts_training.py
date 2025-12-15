@@ -22,7 +22,7 @@ if __name__ == '__main__':
         generating_dataset = True
 
     if generating_dataset:
-        dataset, _ = AudioGuitarTabDataset.create_from_path(piast_yt, limit = 1000)
+        dataset, _ = AudioGuitarTabDataset.create_from_path(piast_yt, limit = 10)
         Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
         dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
     #Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)

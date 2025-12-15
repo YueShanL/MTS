@@ -16,7 +16,7 @@ if __name__ == '__main__':
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
     #dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
 
-    for i in range(10):
+    for i in range(1):
         sample = dataset[random.randint(0, len(dataset) - 1)]
         audio = sample['audio_input']
         target = decode(sample['target_notes'])

@@ -98,7 +98,12 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             end_idx = len(self)
 
         for idx in range(start_idx, end_idx):
-            yield self[idx]
+            example = self[idx]
+            yield {
+                'audio_input': example['audio_input'].tolist(),
+                'context_notes': {k: a.tolist() for k, a in example['context_notes'].items()},
+                'target_notes': {k: a.tolist() for k, a in example['target_notes'].items()}
+            }
 
 
 
