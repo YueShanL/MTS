@@ -19,14 +19,20 @@ if __name__ == '__main__':
         generated_audio_dir=generated_audio_dir
     )
 
+    def parse_generator():
+        for example in process_style_transfer_dataset(Dataset.from_dict(data[:25]), generator=True):
+            yield example
+
     # 创建迭代器
-    data_generator = process_style_transfer_dataset(Dataset.from_dict(data[400]), generator=True)
+    #data_generator = process_style_transfer_dataset(Dataset.from_dict(data[:25]), generator=True)
+
+    Dataset.from_generator(process_style_transfer_dataset, gen_kwargs={"dataset": Dataset.from_dict(data[:25]), "generator": True}).save_to_disk(dataset_path)
 
     # 分批处理
     batch_size = 20
     first_batch = True
 
-    while True:
+    '''while True:
         try:
             # 收集一批数据
             batch = []
@@ -55,7 +61,7 @@ if __name__ == '__main__':
                 combined_dataset = concatenate_datasets([existing_dataset, batch_dataset])
                 combined_dataset.save_to_disk(dataset_path)
                 print(f"Processed final batch with {len(batch)} records")
-            break
+            break'''
 
     # 加载最终数据集
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")

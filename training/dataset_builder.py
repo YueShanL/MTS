@@ -221,7 +221,9 @@ def process_style_transfer_dataset(dataset: Dataset, generator = False, cache_di
     # 应用处理函数
     if generator:
         for example in dataset:
-            yield process_example(example)
+            processed_example = process_example(example)
+            if processed_example is not None:
+                yield processed_example
     else:
         processed_dataset = dataset.sort(column_names='part_index').map(
             process_example,
@@ -229,7 +231,7 @@ def process_style_transfer_dataset(dataset: Dataset, generator = False, cache_di
             cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
             writer_batch_size=10,  # 控制写入批次大小
             # load_from_cache_file=False,  # 强制重新处理
-        ).filter(lambda example: example is not None)
+        ).to_iterable_dataset().filter(lambda example: example is not None)
 
         return processed_dataset
 
