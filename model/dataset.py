@@ -148,7 +148,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             encoded = cls.encode_tab_sequence(dataset, song=song)
             tab_data.append(encoded)
             duration = len(encoded['duration']) / 8
-            wav, _ = midi_to_audio_tensor(f.__str__(), soundfont_path, dataset.sample_rate, duration, False)
+            wav, _ = midi_to_audio_tensor(f.__str__(), sr=dataset.sample_rate, duration=duration, debug=False)
             audio_inputs.append(wav)
 
         dataset.init_cumulative_slices()
