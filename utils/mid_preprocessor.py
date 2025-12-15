@@ -5,7 +5,7 @@ import torch
 import os
 from pathlib import Path
 
-def midi_to_audio_tensor(midi_path, soundfont_path, sr=44100, duration=None, return_numpy=False,
+def midi_to_audio_tensor(midi_path, soundfont_path = None, sr=44100, duration=None, return_numpy=False,
                         debug=False, debug_dir="debug_output", save_audio=False,
                         visualize=False, normalize=True):
     """
@@ -26,6 +26,12 @@ def midi_to_audio_tensor(midi_path, soundfont_path, sr=44100, duration=None, ret
         audio_tensor (torch.Tensor或numpy.ndarray): 形状为 (samples,) 的音频张量
         sr (int): 采样率
     """
+
+    if soundfont_path is None:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_dir = os.path.dirname(current_dir)
+
+        soundfont_path = os.path.join(project_dir, "asset/GeneralUser-GS.sf2")
     try:
         # 创建调试输出目录
         if debug and not os.path.exists(debug_dir):

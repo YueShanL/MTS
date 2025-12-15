@@ -19,7 +19,7 @@ if __name__ == '__main__':
         generated_audio_dir=generated_audio_dir
     )
 
-    dataset = Dataset.from_generator(process_style_transfer_dataset, gen_kwargs={"dataset": Dataset.from_dict(data[:400]), "generator": True})
+    dataset = Dataset.from_generator(process_style_transfer_dataset, gen_kwargs={"dataset": Dataset.from_dict(data[:2]), "generator": True})
     DatasetDict({"train": dataset}).save_to_disk(dataset_path)
 
     #data = process_style_transfer_dataset(Dataset.from_dict(data[:210]))

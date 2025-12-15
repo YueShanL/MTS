@@ -189,7 +189,7 @@ def process_style_transfer_dataset(dataset: Dataset, generator = False, cache_di
 
             # 加载目标音频
             soundfont_path = "../asset/GeneralUser-GS.sf2"
-            target_waveform, target_sr = midi_to_audio_tensor(example["original_path"], soundfont_path=soundfont_path)
+            target_waveform, target_sr = midi_to_audio_tensor(example["original_path"])#, soundfont_path=soundfont_path)
 
             if example['part_index'] > 0:
                 print(
