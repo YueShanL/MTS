@@ -1,4 +1,7 @@
-from datasets import DatasetDict, Dataset, concatenate_datasets
+import os
+import shutil
+
+from datasets import DatasetDict, Dataset, concatenate_datasets, IterableDataset
 
 from data.loader import load_piast_dataset
 from training.dataset_builder import load_audio_dataset, process_style_transfer_dataset
@@ -19,49 +22,60 @@ if __name__ == '__main__':
         generated_audio_dir=generated_audio_dir
     )
 
-    def parse_generator():
-        for example in process_style_transfer_dataset(Dataset.from_dict(data[:25]), generator=True):
-            yield example
+    temp_dir = f"{dataset_path}_cache"
 
-    # 创建迭代器
-    #data_generator = process_style_transfer_dataset(Dataset.from_dict(data[:25]), generator=True)
-
-    Dataset.from_generator(process_style_transfer_dataset, gen_kwargs={"dataset": Dataset.from_dict(data[:25]), "generator": True}).save_to_disk(dataset_path)
-
+    iterable_dataset = IterableDataset.from_generator(process_style_transfer_dataset, gen_kwargs={"dataset": Dataset.from_dict(data[:400]), "generator": True})
     # 分批处理
     batch_size = 20
+    batch_count = 0
     first_batch = True
 
-    '''while True:
-        try:
-            # 收集一批数据
-            batch = []
-            for _ in range(batch_size):
-                batch.append(next(data_generator))
+    current_batch = []
 
-            # 创建数据集
-            batch_dataset = Dataset.from_list(batch)
+    for record in iterable_dataset:
+        current_batch.append(record)
 
-            # 保存或追加
-            if first_batch:
-                batch_dataset.save_to_disk(dataset_path)
-                first_batch = False
-            else:
-                existing_dataset = Dataset.load_from_disk(dataset_path)
-                combined_dataset = concatenate_datasets([existing_dataset, batch_dataset])
-                combined_dataset.save_to_disk(dataset_path)
+        if len(current_batch) >= batch_size:
+            # 保存当前批次
+            batch_path = os.path.join(temp_dir, f"batch_{batch_count}")
+            os.makedirs(batch_path, exist_ok=True)
 
-            print(f"Processed batch with {len(batch)} records")
+            batch_dataset = Dataset.from_list(current_batch)
+            batch_dataset.save_to_disk(batch_path)
 
-        except StopIteration:
-            # 处理最后一批可能不满batch_size的数据
-            if batch:
-                existing_dataset = Dataset.load_from_disk(dataset_path)
-                batch_dataset = Dataset.from_list(batch)
-                combined_dataset = concatenate_datasets([existing_dataset, batch_dataset])
-                combined_dataset.save_to_disk(dataset_path)
-                print(f"Processed final batch with {len(batch)} records")
-            break'''
+            batch_count += 1
+            current_batch = []
+            print(f"Saved batch {batch_count}")
+
+    # 保存最后一批
+    if current_batch:
+        batch_path = os.path.join(temp_dir, f"batch_{batch_count}")
+        os.makedirs(batch_path, exist_ok=True)
+        batch_dataset = Dataset.from_list(current_batch)
+        batch_dataset.save_to_disk(batch_path)
+
+    # 合并所有批次
+    if os.path.exists(temp_dir):
+        # 列出所有批次
+        batch_dirs = sorted([d for d in os.listdir(temp_dir)
+                           if os.path.isdir(os.path.join(temp_dir, d))])
+
+        if batch_dirs:
+            # 加载第一个批次
+            first_batch_path = os.path.join(temp_dir, batch_dirs[0])
+            combined_dataset = Dataset.load_from_disk(first_batch_path)
+
+            # 合并其他批次
+            for batch_dir in batch_dirs[1:]:
+                batch_path = os.path.join(temp_dir, batch_dir)
+                batch_dataset = Dataset.load_from_disk(batch_path)
+                combined_dataset = concatenate_datasets([combined_dataset, batch_dataset])
+
+            # 保存合并后的数据集
+            combined_dataset.save_to_disk(dataset_path)
+
+            # 清理临时目录
+            shutil.rmtree(temp_dir)
 
     # 加载最终数据集
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
