@@ -421,10 +421,11 @@ class MTSGen(PreTrainedModel):
 class AutoregressiveMultiTaskLoss(nn.Module):
     """自回归多任务损失函数（每根弦独立）"""
 
-    def __init__(self, config, weights=None):
+    def __init__(self, config, weights=None, gamma=2.0):
         super().__init__()
         self.config = config
         self.weights = weights or {'duration': 1.0, 'fret': 1.0, 'technique': 0.5}
+        self.gamma = gamma
         self._setup_class_weights()
 
     def _setup_class_weights(self):
@@ -472,7 +473,9 @@ class AutoregressiveMultiTaskLoss(nn.Module):
                     weight=class_weight,
                     ignore_index=-100
                 )
-                fret_loss += loss
+                pt = torch.exp(-loss)  # 模型对真实类别的预测概率
+                focal_loss = ((1 - pt) ** self.gamma) * loss
+                fret_loss += focal_loss
 
             total_loss += self.weights['fret'] * (fret_loss / num_strings)
 
