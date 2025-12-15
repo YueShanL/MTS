@@ -164,7 +164,7 @@ def load_audio_dataset(piast_data, generated_audio_dir):
     return dataset
 
 
-def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"):
+def process_style_transfer_dataset(dataset: Dataset, generator = False, cache_dir="./dataset_cache"):
     """
     处理风格转换数据集，添加音频编码
     """
@@ -219,15 +219,19 @@ def process_style_transfer_dataset(dataset: Dataset, cache_dir="./dataset_cache"
             return None
 
     # 应用处理函数
-    processed_dataset = dataset.sort(column_names='part_index').map(
-        process_example,
-        remove_columns=dataset.column_names,
-        cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
-        writer_batch_size=10,  # 控制写入批次大小
-        # load_from_cache_file=False,  # 强制重新处理
-    ).filter(lambda example: example is not None)
+    if generator:
+        for example in dataset:
+            yield process_example(example)
+    else:
+        processed_dataset = dataset.sort(column_names='part_index').map(
+            process_example,
+            remove_columns=dataset.column_names,
+            cache_file_name=os.path.join(cache_dir, "style_transfer_cache.arrow"),  # 缓存到磁盘
+            writer_batch_size=10,  # 控制写入批次大小
+            # load_from_cache_file=False,  # 强制重新处理
+        ).filter(lambda example: example is not None)
 
-    return processed_dataset
+        return processed_dataset
 
 
 if __name__ == '__main__':
