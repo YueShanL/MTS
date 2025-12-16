@@ -41,7 +41,7 @@ if __name__ == '__main__':
             os.makedirs(batch_path, exist_ok=True)
 
             batch_dataset = Dataset.from_list(current_batch)
-            batch_dataset.save_to_disk(batch_path)
+            batch_dataset.save_to_disk(batch_path, num_shards=batch_size - 1)
 
             batch_count += 1
             current_batch = []
@@ -52,7 +52,7 @@ if __name__ == '__main__':
         batch_path = os.path.join(temp_dir, f"batch_{batch_count}")
         os.makedirs(batch_path, exist_ok=True)
         batch_dataset = Dataset.from_list(current_batch)
-        batch_dataset.save_to_disk(batch_path)
+        batch_dataset.save_to_disk(batch_path, num_shards=len(current_batch) - 1)
 
     # 合并所有批次
     if os.path.exists(temp_dir):
