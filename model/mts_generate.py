@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import Dataset
+from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import PreTrainedModel, EncodecModel
@@ -531,32 +532,32 @@ class MTSGenTrainer:
 
         for sample in batch:
             # 1. 音频数据
-            audio_list.append(sample['audio_input'])
+            audio_list.append(Tensor(sample['audio_input']))
 
             # 2. 上下文数据 - 直接提取，假设结构固定
             context_notes = sample['context_notes']
-            context_duration.append(context_notes['duration'])
-            context_fret.append(context_notes['fret'])
-            context_technique.append(context_notes['technique'])
+            context_duration.append(Tensor(context_notes['duration']))
+            context_fret.append(Tensor(context_notes['fret']))
+            context_technique.append(Tensor(context_notes['technique']))
 
             # 3. 目标数据
             target_notes = sample['target_notes']
-            target_duration.append(target_notes['duration'])
-            target_fret.append(target_notes['fret'])
-            target_technique.append(target_notes['technique'])
+            target_duration.append(Tensor(target_notes['duration']))
+            target_fret.append(Tensor(target_notes['fret']))
+            target_technique.append(Tensor(target_notes['technique']))
 
         # 使用torch.stack一次性堆叠，减少碎片化操作
         batched = {
             'audio_input': torch.stack(audio_list).unsqueeze(1),  # [B, 1, T]
             'context_notes': {
-                'duration': torch.stack(context_duration),
-                'fret': torch.stack(context_fret),
-                'technique': torch.stack(context_technique)
+                'duration': torch.stack(context_duration).to(torch.int64),
+                'fret': torch.stack(context_fret).to(torch.int64),
+                'technique': torch.stack(context_technique).to(torch.int64)
             },
             'target_notes': {
-                'duration': torch.stack(target_duration),
-                'fret': torch.stack(target_fret),
-                'technique': torch.stack(target_technique)
+                'duration': torch.stack(target_duration).to(torch.int64),
+                'fret': torch.stack(target_fret).to(torch.int64),
+                'technique': torch.stack(target_technique).to(torch.int64)
             }
         }
 

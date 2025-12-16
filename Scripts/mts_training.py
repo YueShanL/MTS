@@ -15,7 +15,7 @@ if __name__ == '__main__':
     generating_dataset = False
 
     try:
-        dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
+        dataset = Dataset.load_from_disk(dataset_path)
         #dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
     except Exception as e:
         print(f'failed to load from {dataset_path} because {e}, trying to generate dataset')
@@ -24,7 +24,7 @@ if __name__ == '__main__':
     if generating_dataset:
         dataset, _ = AudioGuitarTabDataset.create_from_path(piast_yt, limit = 10)
         Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
-        dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
+        dataset = Dataset.load_from_disk(dataset_path)
     #Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
 
 
