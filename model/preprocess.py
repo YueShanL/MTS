@@ -124,19 +124,32 @@ class PositionalEncoding(nn.Module):
 
     def __init__(self, hidden_size, max_position=512):
         super().__init__()
+        self.hidden_size = hidden_size
+        # 可学习的位置嵌入
         self.position_embeddings = nn.Embedding(max_position, hidden_size)
-        self.max_position = max_position
+        # 可选：保持一个固定的正弦余弦编码作为基础
+        self.register_buffer('inv_freq', 1.0 / (10000 ** (torch.arange(0.0, hidden_size, 2.0) / hidden_size)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """为输入添加位置编码"""
-        batch_size, seq_len, hidden_size = x.shape
+    def forward(self, x, position_ids=None):
+        """
+        x: [batch, seq_len, hidden]
+        返回: [batch, seq_len, hidden*2] 或同维度
+        """
+        seq_len = x.size(1)
+        device = x.device
 
-        # 创建位置ID
-        position_ids = torch.arange(seq_len, device=x.device)
-        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        if position_ids is None:
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).expand(x.size(0), -1)
 
-        # 获取位置编码
-        position_embeddings = self.position_embeddings(position_ids)
+        # 方法A：拼接位置编码（维度加倍，需要调整后续投影）
+        pos_emb = self.position_embeddings(position_ids)  # [batch, seq, hidden]
+        # return torch.cat([x, pos_emb], dim=-1)  # 维度变为 hidden*2
 
-        # 添加到输入
-        return x + position_embeddings
+        # 方法B：增强的加性编码（幅度更大）
+        pos_emb = pos_emb * 2.0  # 放大位置编码的强度
+        return x + pos_emb
+
+    def get_embeddings(self, position_ids):
+        """获取位置编码（用于自回归生成）"""
+        return self.position_embeddings(position_ids) * 2.0

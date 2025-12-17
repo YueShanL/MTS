@@ -96,7 +96,7 @@ class MTSGenConfig(PretrainedConfig):
         self.target_temporal_resolution = target_temporal_resolution
 
     @staticmethod
-    def mtsGen_30m(): return MTSGenConfig(
+    def mtsGen_150m(): return MTSGenConfig(
                 hidden_size=1024,  # 增加隐藏层维度
                 num_hidden_layers=12,  # 增加层数
                 num_attention_heads=16,  # 增加头数，1024 ÷ 16 = 64
@@ -109,7 +109,7 @@ class MTSGenConfig(PretrainedConfig):
                 freeze_encoder=True
             )
     @staticmethod
-    def mtsGen_1B_wide(): return MTSGenConfig(
+    def mtsGen_1b_500m_wide(): return MTSGenConfig(
             hidden_size=2048,  # 从1024翻倍至2048，这是最关键的一步
             num_hidden_layers=24,  # 从12层翻倍至24层
             num_attention_heads=32,  # 头数相应增加，2048 ÷ 32 = 64（每头维度）
@@ -123,7 +123,7 @@ class MTSGenConfig(PretrainedConfig):
         )
 
     @staticmethod
-    def mtsGen_1B_depth(): return MTSGenConfig(
+    def mtsGen_300m_depth(): return MTSGenConfig(
             num_hidden_layers=48,  # 非常大的深度
             num_attention_heads=32,  # 1600 ÷ 32 = 50
             intermediate_size=6400,  # 增加前馈网络维度

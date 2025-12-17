@@ -28,8 +28,8 @@ if __name__ == '__main__':
     #Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
 
 
-    config = MTSGenConfig.mtsGen_30m()
+    config = MTSGenConfig.mtsGen_150m()
     model = MTSGen(config)
-    #model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
+    model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
     trainer = MTSGenTrainer(config, model = model)
     trainer.train(dataset, output_path=output_path)
