@@ -426,356 +426,100 @@ class MTSGen(PreTrainedModel):
         return mask.masked_fill(mask == 1, float('-inf'))
 
 
-# ============ 损失函数 ============
-class AutoregressiveMultiTaskLoss(nn.Module):
-    """自回归多任务损失函数（每根弦独立），集成Focal Loss"""
+class MixedTrainingForward:
+    """混合训练前向传播处理器"""
 
-    def __init__(self, config, weights=None, use_focal=True,
-                 gamma=2.0, alpha_scale=2.0):
-        """
-        Args:
-            config: 模型配置
-            weights: 各任务权重
-            use_focal: 是否使用Focal Loss
-            gamma: Focal Loss的gamma参数
-            alpha_scale: 类别平衡权重缩放因子
-        """
-        super().__init__()
-        self.config = config
-        self.weights = weights or {'duration': 1.0, 'fret': 1.0, 'technique': 0.5}
-        self.use_focal = use_focal
-        self.gamma = gamma
+    def __init__(self, model):
+        self.model = model
 
-        # 设置类别权重和Focal Loss参数
-        self._setup_class_weights(alpha_scale)
+    def __call__(self, memory, target_notes, teacher_forcing_prob=0.5):
+        """执行混合训练前向传播"""
+        batch_size = target_notes['duration'].shape[0]
+        target_len = target_notes['duration'].shape[1]
+        device = memory.device
 
-        # 初始化Focal Loss实例
-        if use_focal:
-            self._init_focal_losses()
+        # 初始化序列
+        current_input = self._init_sequence(batch_size, device)
 
-    def _setup_class_weights(self, alpha_scale):
-        """设置吉他任务特定的权重"""
-        # 1. Duration: 基础类别权重（用于加权交叉熵）
-        self.duration_weight = torch.ones(self.config.num_durations)
-        #self.duration_weight[0] = 0.1  # 休止符权重较低
-
-        # Duration的alpha参数（用于Focal Loss）
-        self.duration_alpha = torch.ones(self.config.num_durations)
-        self.duration_alpha[0] = 0.3  # 休止符
-        # 给中等时值更高权重
-        mid_idx = self.config.num_durations // 2
-        self.duration_alpha[mid_idx - 2:mid_idx + 3] = alpha_scale
-
-        # 2. Fret: 基础类别权重
-        self.fret_weight = torch.ones(self.config.max_fret + 2)
-        #self.fret_weight[0] = 0.5  # 空弦
-        self.fret_weight[-1] = 0.3  # 不演奏
-
-        # Fret的alpha参数
-        self.fret_alpha = torch.ones(self.config.max_fret + 2)
-        #self.fret_alpha[0] = 0.5
-        self.fret_alpha[-1] = 0.3
-        # 常用品位（0-12品）权重更高
-        #for i in range(1, min(13, len(self.fret_alpha) - 1)):
-        #    self.fret_alpha[i] = alpha_scale * (1.0 - i / 20.0)
-
-        # 3. Technique: 基础类别权重
-        self.technique_weight = torch.ones(self.config.num_techniques)
-        #self.technique_weight[0] = 0.6  # NORMAL技巧权重较低
-
-        # Technique的alpha参数
-        self.technique_alpha = torch.ones(self.config.num_techniques)
-        #self.technique_alpha[0] = 0.6
-
-        # 特殊技巧更高权重
-        special_techniques = {
-            1: 1.5,  # 击弦
-            2: 1.5,  # 勾弦
-            3: 1.8,  # 滑音
-            4: 2.0,  # 弯音
-            5: 1.7,  # 泛音
-            6: 1.3,  # 闷音
-        }
-        #for idx, weight in special_techniques.items():
-        #    if idx < len(self.technique_alpha):
-        #        self.technique_alpha[idx] = weight
-
-    def _init_focal_losses(self):
-        """初始化Focal Loss实例"""
-        # Duration的Focal Loss
-        self.duration_focal = FocalLoss(
-            alpha=self.duration_alpha,
-            gamma=self.gamma,
-            reduction='mean',
-            weight=self.duration_weight,  # 可以同时使用类别权重
-            ignore_index=-100
+        # 生成过程
+        return self._generate_mixed_sequence(
+            memory, target_notes, current_input,
+            target_len, teacher_forcing_prob, device
         )
 
-        # Fret的Focal Loss（每根弦共享配置）
-        self.fret_focal = FocalLoss(
-            alpha=self.fret_alpha,
-            gamma=self.gamma * 0.8,  # Fret任务gamma稍低
-            reduction='mean',
-            weight=self.fret_weight,
-            ignore_index=-100
+    def _init_sequence(self, batch_size, device):
+        """初始化起始序列"""
+        start_input = self.model.start_token.expand(batch_size, 1, -1).to(device)
+        start_input = start_input + self.model.positional_encoding.position_embeddings(
+            torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
+        return start_input
 
-        # Technique的Focal Loss
-        self.technique_focal = FocalLoss(
-            alpha=self.technique_alpha,
-            gamma=self.gamma * 0.8,  # Technique任务gamma稍低
-            reduction='mean',
-            weight=self.technique_weight,
-            ignore_index=-100
-        )
+    def _generate_mixed_sequence(self, memory, target_notes, current_input,
+                                 target_len, teacher_forcing_prob, device):
+        """混合生成序列"""
+        all_outputs = {'duration': [], 'fret': [], 'technique': []}
+        all_logits = {'duration': [], 'fret': [], 'technique': []}
 
-        # 也保留标准交叉熵版本用于对比
-        self.standard_ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
+        for t in range(target_len):
+            # 解码当前步
+            step_outputs = self._decode_step(current_input, memory)
 
-    def forward(self, predictions, targets, device='cuda'):
-        """计算损失"""
-        total_loss = 0
-        loss_details = {}
+            # 存储logits和预测
+            self._store_step_outputs(step_outputs, all_outputs, all_logits, t)
 
-        # 将类别权重移动到设备
-        self.duration_weight = self.duration_weight.to(device)
-        self.fret_weight = self.fret_weight.to(device)
-        self.technique_weight = self.technique_weight.to(device)
-
-        # 1. duration损失
-        if 'duration' in predictions and 'duration' in targets:
-            pred = predictions['duration']  # [B, L, C]
-            target = targets['duration']  # [B, L]
-
-            if self.use_focal:
-                duration_loss = self.duration_focal(pred, target)
-            else:
-                # 使用加权交叉熵
-                duration_loss = F.cross_entropy(
-                    pred.view(-1, pred.size(-1)),
-                    target.view(-1),
-                    weight=self.duration_weight,
-                    ignore_index=-100
+            # 准备下一步输入（如果不是最后一步）
+            if t < target_len - 1:
+                current_input = self._prepare_next_input(
+                    current_input, step_outputs, target_notes,
+                    t, teacher_forcing_prob, device
                 )
 
-            total_loss += self.weights['duration'] * duration_loss
-            loss_details['duration_loss'] = duration_loss.item()
+        return self._format_outputs(all_outputs, all_logits)
 
-        # 2. 每根弦的品位损失
-        if 'fret' in predictions and 'fret' in targets:
-            pred = predictions['fret']  # [B, L, S, C]
-            target = targets['fret']  # [B, L, S]
-            batch_size, seq_len, num_strings, num_classes = pred.shape
+    def _decode_step(self, current_input, memory):
+        """解码单个时间步"""
+        seq_len = current_input.shape[1]
+        tgt_mask = self.model._generate_square_subsequent_mask(seq_len).to(memory.device)
 
-            fret_loss = 0
-            for s in range(num_strings):
-                pred_s = pred[:, :, s, :]  # [B, L, C]
-                target_s = target[:, :, s]  # [B, L]
+        decoder_output = self.model.autoregressive_decoder(current_input, memory, tgt_mask)
+        last_output = decoder_output[:, -1:, :]
+        last_output = self.model.output_norm(last_output)
 
-                if self.use_focal:
-                    # 使用Focal Loss
-                    string_loss = self.fret_focal(pred_s, target_s)
-                else:
-                    # 使用加权交叉熵
-                    string_loss = F.cross_entropy(
-                        pred_s.view(-1, num_classes),
-                        target_s.view(-1),
-                        weight=self.fret_weight,
-                        ignore_index=-100
-                    )
+        return self.model._compute_outputs(last_output)
 
-                fret_loss += string_loss
+    def _store_step_outputs(self, step_outputs, all_outputs, all_logits, step_idx):
+        """存储当前步骤的输出"""
+        for key in ['duration', 'fret', 'technique']:
+            if key in step_outputs:
+                all_logits[key].append(step_outputs[key])
+                predicted = self.model._sample_next_note(step_outputs, do_sample=False)[key]
+                all_outputs[key].append(predicted)
 
-            fret_loss = fret_loss / num_strings
-            total_loss += self.weights['fret'] * fret_loss
-            loss_details['fret_loss'] = fret_loss.item()
+    def _prepare_next_input(self, current_input, step_outputs, target_notes,
+                            step_idx, teacher_forcing_prob, device):
+        """准备下一个时间步的输入"""
+        use_teacher_forcing = random.random() < teacher_forcing_prob
 
-        # 3. 每根弦的技巧损失
-        if 'technique' in predictions and 'technique' in targets:
-            pred = predictions['technique']  # [B, L, S, C]
-            target = targets['technique']  # [B, L, S]
-            batch_size, seq_len, num_strings, num_classes = pred.shape
+        if use_teacher_forcing:
+            next_note = {k: v[:, step_idx:step_idx + 1] for k, v in target_notes.items()}
+        else:
+            next_note = self.model._sample_next_note(step_outputs, do_sample=False)
 
-            tech_loss = 0
-            for s in range(num_strings):
-                pred_s = pred[:, :, s, :]  # [B, L, C]
-                target_s = target[:, :, s]  # [B, L]
+        next_embedding = self.model.note_embedding(next_note)
+        seq_len = current_input.shape[1]
 
-                if self.use_focal:
-                    # 使用Focal Loss
-                    string_loss = self.technique_focal(pred_s, target_s)
-                else:
-                    # 使用加权交叉熵
-                    string_loss = F.cross_entropy(
-                        pred_s.view(-1, num_classes),
-                        target_s.view(-1),
-                        weight=self.technique_weight,
-                        ignore_index=-100
-                    )
-
-                tech_loss += string_loss
-
-            tech_loss = tech_loss / num_strings
-            total_loss += self.weights['technique'] * tech_loss
-            loss_details['technique_loss'] = tech_loss.item()
-
-        loss_details['total_loss'] = total_loss.item()
-        return total_loss#, loss_details
-
-
-class MTSGenTrainer:
-
-    def __init__(self, config=None, model = None):
-        self.config = config or MTSGenConfig()
-        self.model = model if model is not None else MTSGen(self.config)
-        self.loss_fn = AutoregressiveMultiTaskLoss(self.config)
-        self._setup_optimizer()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    @staticmethod
-    def collate_fn(batch):
-        if not batch:
-            return {}
-
-        # 预先确定键，避免动态扩展字典（小幅优化）
-        first_sample = batch[0]
-        audio_list = []
-
-        # 预先分配列表，假设键固定为这三个
-        context_duration = []
-        context_fret = []
-        context_technique = []
-        target_duration = []
-        target_fret = []
-        target_technique = []
-
-        for sample in batch:
-            # 1. 音频数据
-            audio_list.append(Tensor(sample['audio_input']))
-
-            # 2. 上下文数据 - 直接提取，假设结构固定
-            context_notes = sample['context_notes']
-            context_duration.append(Tensor(context_notes['duration']))
-            context_fret.append(Tensor(context_notes['fret']))
-            context_technique.append(Tensor(context_notes['technique']))
-
-            # 3. 目标数据
-            target_notes = sample['target_notes']
-            target_duration.append(Tensor(target_notes['duration']))
-            target_fret.append(Tensor(target_notes['fret']))
-            target_technique.append(Tensor(target_notes['technique']))
-
-        # 使用torch.stack一次性堆叠，减少碎片化操作
-        batched = {
-            'audio_input': torch.stack(audio_list).unsqueeze(1),  # [B, 1, T]
-            'context_notes': {
-                'duration': torch.stack(context_duration).to(torch.int64),
-                'fret': torch.stack(context_fret).to(torch.int64),
-                'technique': torch.stack(context_technique).to(torch.int64)
-            },
-            'target_notes': {
-                'duration': torch.stack(target_duration).to(torch.int64),
-                'fret': torch.stack(target_fret).to(torch.int64),
-                'technique': torch.stack(target_technique).to(torch.int64)
-            }
-        }
-
-        return batched
-
-    def _setup_optimizer(self):
-        encoder_params = []
-        decoder_params = []
-        embedding_params = []
-
-        for name, param in self.model.named_parameters():
-            if 'audio_encoder' in name and self.config.freeze_encoder:
-                param.requires_grad = False
-            elif 'audio_encoder' in name:
-                encoder_params.append(param)
-            elif any(x in name for x in ['embedding', 'start_token']):
-                embedding_params.append(param)
-            else:
-                decoder_params.append(param)
-
-        self.optimizer = torch.optim.AdamW([
-            {'params': encoder_params, 'lr': 1e-5},
-            {'params': decoder_params, 'lr': 1e-4},
-            {'params': embedding_params, 'lr': 5e-4}
-        ], weight_decay=0.01)
-
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=3, factor=0.5
+        next_embedding = next_embedding + self.model.positional_encoding.position_embeddings(
+            torch.full((current_input.shape[0], 1), seq_len, dtype=torch.long, device=device)
         )
 
-    def train(self, dataset, batch_size = 8, num_epoch = 20, output_path = ''):
-        """完整的训练循环"""
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model.to(device)
-        self.model.train()
+        return torch.cat([current_input, next_embedding], dim=1)
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=self.collate_fn, pin_memory=True,shuffle=True, num_workers=8)
-
-        avg_loss = 0
-        for epoch in range(num_epoch):
-            epoch_loss = 0
-            progress_bar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{num_epoch}')
-
-            for batch_idx, batch in enumerate(progress_bar):
-                batch['audio_input'] = batch['audio_input'].to(device)
-                for key in batch['context_notes'].keys():
-                    batch['context_notes'][key] = batch['context_notes'][key].to(device)
-                    batch['target_notes'][key] = batch['target_notes'][key].to(device)
-
-                loss = self.train_step(batch)
-                epoch_loss += loss
-
-
-                progress_bar.set_postfix({'loss': f'{loss:.4f}'})
-
-            # 计算平均损失
-            avg_loss = epoch_loss / len(dataloader)
-            print(f'Epoch {epoch + 1}: Average Loss = {avg_loss:.4f}')
-
-            # 更新学习率
-            self.scheduler.step(avg_loss)
-
-            # 可选：保存检查点
-            if (epoch + 1) % 5 == 0:
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': avg_loss,
-                }
-                torch.save(checkpoint, f'{output_path}/checkpoint_epoch_{epoch + 1}.pt')
-
-        return avg_loss
-
-    def train_step(self, batch):
-        """训练步骤"""
-        audio_input = batch['audio_input']
-        context_notes = batch['context_notes']
-        target_notes = batch['target_notes']
-
-        # 前向传播
-        outputs = self.model(
-            audio_input=audio_input,
-            context_notes=context_notes,
-            target_notes=target_notes,
-            do_sample=False,
-            teacher_forcing=True
-        )
-
-        # 计算损失
-        loss = self.loss_fn(outputs, target_notes, device=audio_input.device)
-
-        # 反向传播
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-
-        return loss.item()
+    def _format_outputs(self, all_outputs, all_logits):
+        """格式化输出"""
+        predictions = {k: torch.cat(v, dim=1) for k, v in all_outputs.items() if v}
+        logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items() if v}
+        return {'predictions': predictions, 'logits': logits}
 
 
 

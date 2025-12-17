@@ -6,7 +6,8 @@ from datasets import Dataset, IterableDataset, concatenate_datasets
 
 from model.dataset import AudioGuitarTabDataset
 from model.mts_config import MTSGenConfig
-from model.mts_generate import MTSGenTrainer, MTSGen
+from model.mts_generate import MTSGen
+from model.trainer import train_mixed_model
 
 linux = 0
 debug = 0
@@ -16,12 +17,12 @@ if __name__ == '__main__':
     piast_yt = "data/dataset/PIAST/piast_yt/midi" if linux else "../data/dataset/PIAST/piast_yt/midi"
 
     generating_dataset = False
-    dataset_length = 1000
+    dataset_length = 400
     current_length = 0
 
     try:
         dataset = Dataset.load_from_disk(dataset_path)
-        current_length = len(dataset)
+        current_length = int(dataset.info.description)
         if current_length < dataset_length:
             generating_dataset = True
         #dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
@@ -100,5 +101,6 @@ if __name__ == '__main__':
     config = MTSGenConfig.mtsGen_150m()
     model = MTSGen(config)
     model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
-    trainer = MTSGenTrainer(config, model = model)
-    trainer.train(dataset, output_path=output_path)
+    model.to('cuda')
+    train_mixed_model(model, dataset, val_dataset=None,
+                          num_epochs=20, batch_size=8)
