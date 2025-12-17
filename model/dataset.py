@@ -92,6 +92,53 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             'target_notes': tab_data
         }
 
+    def slide_data(self, audio, tab):
+        audio_length = len(audio)
+        num_slices = max(1,
+                         (audio_length - self.sliding_window * self.sample_rate) // (self.step * self.sample_rate))
+        audio_inputs = []
+        context_notes = []
+        target_notes = []
+        for slice_idx in range(num_slices):
+            audio_start = slice_idx * self.step * self.sample_rate + self.context_len * self.sample_rate
+            audio_end = min(audio_start + (self.segment - self.context_len) * self.sample_rate, audio_length)
+
+            input_audio = audio[audio_start:audio_end]
+
+            note_length = len(tab['duration'])
+            notes_start = slice_idx * self.step * self.bpm // 60 * 4
+            context_end = notes_start + self.context_len * self.bpm // 60 * 4
+            notes_end = min(notes_start + self.segment * self.bpm // 60 * 4, note_length)
+
+            tab_data = {}
+            context_data = {}
+            for key in tab.keys():
+                tab_data[key] = tab[key][context_end:notes_end]
+                context_data[key] = tab[key][notes_start:context_end]
+                if len(tab_data[key]) + len(context_data[key]) < self.segment * self.bpm // 60 * 4:
+                    pad_length = self.segment * self.bpm // 60 * 4 - len(tab_data[key])
+                    pad_width = [(0, 0)] * tab_data[key].ndim
+                    pad_width[0] = (0, pad_length)
+                    padded = np.pad(tab_data[key], pad_width, mode='constant')
+                    tab_data[key] = Tensor(padded[self.context_len * self.bpm // 60 * 4:]).to(torch.int64)
+                    context_data[key] = Tensor(padded[:self.context_len * self.bpm // 60 * 4]).to(torch.int64)
+
+            # padding
+            if len(input_audio) < (self.segment - self.context_len) * self.sample_rate:
+                pad_length = (self.segment - self.context_len) * self.sample_rate - len(input_audio)
+                # 使用torch.nn.functional.pad，更高效且与后续流程兼容
+                input_audio = functional.pad(input_audio, (0, pad_length), mode='constant', value=0)
+
+            context_notes.append(context_data)
+            target_notes.append(tab_data)
+            audio_inputs.append(input_audio)
+
+        return {
+            'audio_input': audio_inputs,
+            'context_notes': context_notes,
+            'target_notes': target_notes
+        }
+
     def stream_generator(self, start_idx: int = 0, end_idx: Optional[int] = None) -> Generator[Dict, None, None]:
         """流式生成数据"""
         if end_idx is None:
@@ -129,7 +176,34 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         return
 
     @classmethod
-    def create_from_path(cls, mid_path:str, limit = 1000):
+    def generator_from_path(cls, mid_path:str, start = 0, limit = 1000):
+        extensions = ['.mid', '.midi', '.MID', '.MIDI']
+        midi_files = []
+
+        for ext in extensions:
+            midi_files.extend(Path(mid_path).rglob(f'*{ext}'))
+
+        midi_files = sorted(list(set(midi_files)))
+
+        print(f"find {len(midi_files)} .MIDI files")
+
+        audio_inputs = []
+        tab_data = []
+        dataset = AudioGuitarTabDataset(audio_inputs, tab_data)
+
+        convertor = MIDItoGP5Converter(GuitarProGenerator())
+        for idx, f in enumerate(midi_files[start:start + limit]):
+            if idx >= limit:
+                break
+            song = convertor.convert_midi_to_gp5(midi_path=f.__str__(), post_process=False)
+            encoded = cls.encode_tab_sequence(dataset, song=song)
+            duration = len(encoded['duration']) / 8
+            wav, _ = midi_to_audio_tensor(f.__str__(), sr=dataset.sample_rate, duration=duration, debug=False)
+            yield dataset.slide_data(wav, encoded)
+
+
+    @classmethod
+    def create_from_path(cls, mid_path:str, start = 0, limit = 1000):
         extensions = ['.mid', '.midi', '.MID', '.MIDI']
         midi_files = []
 
@@ -146,7 +220,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
 
         convertor = MIDItoGP5Converter(GuitarProGenerator())
         soundfont_path = "../asset/GeneralUser-GS.sf2"
-        for idx, f in enumerate(midi_files):
+        for idx, f in enumerate(midi_files[start:start + limit]):
             if idx >= limit:
                 break
             song = convertor.convert_midi_to_gp5(midi_path=f.__str__(), post_process=False)
