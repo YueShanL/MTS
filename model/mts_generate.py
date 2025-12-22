@@ -1,5 +1,5 @@
 import random
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, Union
 
 import guitarpro as gp
 import torch
@@ -164,150 +164,162 @@ class MTSGen(PreTrainedModel):
 
 
     def forward(
-            self,
-            audio_input: torch.Tensor,
-            context_notes: Optional[Dict[str, torch.Tensor]] = None,
-            target_notes: Optional[Dict[str, torch.Tensor]] = None,
-            generate_length: Optional[int] = None,
-            teacher_forcing: bool = True,
-            do_sample=True, **kwargs
-    ) -> Dict[str, torch.Tensor]:
-        """前向传播"""
+        self,
+        audio_input: torch.Tensor,
+        context_notes: Optional[Dict[str, torch.Tensor]] = None,
+        target_notes: Optional[Dict[str, torch.Tensor]] = None,
+        generate_length: Optional[int] = None,
+        teacher_forcing: bool = True,
+        do_sample: bool = True,
+        return_logits: bool = False,  # 新增参数
+        **kwargs
+    ) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]:
+        """
+        前向传播，支持返回logits
+        
+        Args:
+            return_logits: 是否返回logits（仅在非Teacher Forcing时有效）
+        
+        Returns:
+            如果teacher_forcing=True或return_logits=False: 返回预测字典
+            如果teacher_forcing=False且return_logits=True: 返回元组 (predictions, logits)
+        """
         # 编码音频
         audio_features = self.encode_audio(audio_input)
-
+        
         # 编码上下文音符（如果有）
         if context_notes is not None:
-            note_embeddings = self.note_embedding(context_notes)
-            context_embeddings = self.positional_encoding(note_embeddings)
+            context_embeddings = self.note_embedding(context_notes)
             combined_features = torch.cat([audio_features, context_embeddings], dim=1)
             memory = self.fusion_encoder(combined_features)
         else:
             memory = self.fusion_encoder(audio_features)
-
+        
+        # 根据训练模式选择
         if target_notes is not None and teacher_forcing:
+            # Teacher Forcing模式：直接返回logits（原本就是logits格式）
             return self._teacher_force_forward(memory, target_notes)
         else:
+            # 自回归生成模式
             generate_length = generate_length or self.config.notes_per_bar * self.config.predict_bars
-            return self._autoregressive_generate(memory, generate_length, do_sample=do_sample)
+            
+            return self._autoregressive_generate(
+                memory, generate_length, do_sample=do_sample, return_logits=return_logits
+            )
 
-    def _teacher_force_forward(self, memory: torch.Tensor, target_notes: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Teacher forcing前向传播"""
+
+    def _teacher_force_forward(
+        self, 
+        memory: torch.Tensor, 
+        target_notes: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Teacher Forcing前向传播，返回logits"""
         batch_size = target_notes['duration'].shape[0]
         target_len = target_notes['duration'].shape[1]
-
-        # 准备右移的目标序列，用-100填充
+        
+        # 准备右移的目标序列
         shifted_notes = {}
         for key in ['duration', 'fret', 'technique']:
             if key in target_notes:
-                shifted = torch.full_like(target_notes[key], -100)  # 用-100填充
+                shifted = torch.full_like(target_notes[key], -100)
                 shifted[:, 1:] = target_notes[key][:, :-1]
                 shifted_notes[key] = shifted
-
+        
         # 嵌入目标序列
         target_embeddings = self.note_embedding(shifted_notes)
         target_embeddings = self.positional_encoding(target_embeddings)
-
+        
         # 添加起始标记
         start_tokens = self.start_token.expand(batch_size, -1, -1)
         target_embeddings = torch.cat([start_tokens, target_embeddings], dim=1)
-
+        
         # 自回归解码
         seq_len = target_embeddings.shape[1]
         tgt_mask = self._generate_square_subsequent_mask(seq_len).to(target_embeddings.device)
         decoder_output = self.autoregressive_decoder(target_embeddings, memory, tgt_mask)
-
+        
         # 去掉起始标记的输出
         decoder_output = decoder_output[:, 1:, :]
         decoder_output = self.output_norm(decoder_output)
+        
+        # 计算输出（logits）
+        return self._compute_outputs(decoder_output)  # 返回logits
 
-        # 计算输出
-        return self._compute_outputs(decoder_output)
-
-    def _autoregressive_generate(self, memory: torch.Tensor, generate_length: int,
-                                 do_sample=True) -> Dict[str, torch.Tensor]:
-        """修复位置编码累积问题的自回归生成"""
+    def _autoregressive_generate(
+        self, 
+        memory: torch.Tensor, 
+        generate_length: int,
+        do_sample: bool = True,
+        return_logits: bool = False  # 新增参数，控制是否返回logits
+    ) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]:
+        """
+        自回归生成方法，可选返回logits
+        
+        Args:
+            memory: 编码后的音频特征 [B, T, D]
+            generate_length: 生成序列长度
+            do_sample: 是否使用采样
+            return_logits: 是否返回logits（为True时返回(predictions, logits)元组）
+        
+        Returns:
+            如果return_logits=False: 返回预测字典 {'duration': [B, L], 'fret': [B, L, S], ...}
+            如果return_logits=True: 返回元组 (predictions, logits)
+        """
         batch_size = memory.shape[0]
         device = memory.device
-
-        # 初始化生成序列（起始标记）
-        # 起始标记需要添加位置0的编码
+        
+        # 初始化序列
         current_input = self.start_token.expand(batch_size, 1, -1).to(device)
-
-        # 为起始标记添加位置0编码
         current_input = current_input + self.positional_encoding.position_embeddings(
             torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
-
-        # 存储生成结果
-        all_outputs = {'duration': [], 'fret': [], 'technique': []}
-
+        
+        # 存储结果
+        all_predictions = {'duration': [], 'fret': [], 'technique': []}
+        all_logits = {'duration': [], 'fret': [], 'technique': []} if return_logits else None
+        
+        # 生成循环
         for step in range(generate_length):
+            # 解码当前步
             seq_len = current_input.shape[1]
-
-            # 创建因果掩码 - 注意：这里序列长度是当前已经生成的序列长度
             tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
-
-            # 解码 - 注意：current_input已经包含了正确的位置编码
-            decoder_output = self.autoregressive_decoder(
-                current_input, memory, tgt_mask
-            )
-
-            # 取最后一个时间步的输出
+            
+            decoder_output = self.autoregressive_decoder(current_input, memory, tgt_mask)
             last_output = decoder_output[:, -1:, :]
             last_output = self.output_norm(last_output)
-
-            # 计算输出
-            step_outputs = self._compute_outputs(last_output)
-
-            # 采样下一个音符
-            force_sample = (step < 0)  # 前10步强制随机采样
-            next_note = self._sample_next_note(
-                step_outputs,
-                do_sample=force_sample or do_sample,
-                temperature=1.5 if force_sample else 0.8
-            )
-
-            # 将离散音符转换为嵌入向量
-            next_note_embedding = self.note_embedding(next_note)
-
-            next_pos_emb = self.positional_encoding.position_embeddings(
+            
+            # 计算logits
+            step_logits = self._compute_outputs(last_output)
+            
+            # 存储logits（如果需要）
+            if return_logits:
+                for key in step_logits:
+                    if key in all_logits:
+                        all_logits[key].append(step_logits[key])
+            
+            # 采样预测
+            step_predictions = self._sample_next_note(step_logits, do_sample=do_sample)
+            
+            # 存储预测
+            for key in step_predictions:
+                if key in all_predictions:
+                    all_predictions[key].append(step_predictions[key])
+            
+            # 准备下一步输入
+            next_embedding = self.note_embedding(step_predictions)
+            next_embedding = next_embedding + self.positional_encoding.position_embeddings(
                 torch.full((batch_size, 1), seq_len, dtype=torch.long, device=device)
-            ) * 2.0
-
-            next_note_embedding = next_note_embedding + next_pos_emb
-
-            # 16. 对新音符嵌入进行层归一化
-            next_note_embedding = F.layer_norm(next_note_embedding, (next_note_embedding.size(-1),))
-
-            # 将新音符拼接到输入序列
-            current_input = torch.cat([current_input, next_note_embedding], dim=1)
-
-            # 存储输出
-            for key in all_outputs:
-                all_outputs[key].append(next_note[key])
-
-            #调试注意力 == == == == == ==
-            if step in range(10, 15):  # 只检查前几步
-                # 假设你的解码器层可以返回注意力权重
-                # 或者修改模型以返回注意力
-                attn_weights = decoder_output.attn_weights if hasattr(decoder_output, 'attn_weights') else None
-                if attn_weights is not None:
-                    print(f'Step{step} - Attn std: {attn_weights.std().item(): .4f}, mean: {attn_weights.mean().item(): .4f}')
-
-            # 可选：打印调试信息（生成时可以查看）
-            if step < 5 or step % 10 == 0:
-                print(f"Step {step}: Generated duration={next_note['duration'][0].item()}, "
-                      f"fret={next_note['fret'].tolist()}")
-                print(f'Step{step} - current_input mean: {current_input.mean().item(): .4f}, std: {current_input.std().item(): .4f}')
-
-        # 合并所有时间步
-        outputs = {}
-        for key in all_outputs:
-            if all_outputs[key]:
-                outputs[key] = torch.cat(all_outputs[key], dim=1)
-
-        return outputs
+            )
+            current_input = torch.cat([current_input, next_embedding], dim=1)
+        
+        # 合并结果
+        predictions = {k: torch.cat(v, dim=1) for k, v in all_predictions.items()}
+        
+        if return_logits:
+            logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items()}
+            return predictions, logits
+        else:
+            return predictions
 
     def _compute_outputs(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """计算各输出头"""

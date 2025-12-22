@@ -92,7 +92,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             'target_notes': tab_data
         }
 
-    def slide_data(self, audio, tab):
+    def slide_data(self, audio, tab, type = "pt"):
         audio_length = len(audio)
         num_slices = max(1,
                          (audio_length - self.sliding_window * self.sample_rate) // (self.step * self.sample_rate))
@@ -123,21 +123,24 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
                     tab_data[key] = Tensor(padded[self.context_len * self.bpm // 60 * 4:]).to(torch.int64)
                     context_data[key] = Tensor(padded[:self.context_len * self.bpm // 60 * 4]).to(torch.int64)
 
+                if type == 'py':
+                    tab_data[key] = tab_data[key].tolist()
+                    context_data[key] = context_data[key].tolist()
+
             # padding
             if len(input_audio) < (self.segment - self.context_len) * self.sample_rate:
                 pad_length = (self.segment - self.context_len) * self.sample_rate - len(input_audio)
                 # 使用torch.nn.functional.pad，更高效且与后续流程兼容
                 input_audio = functional.pad(input_audio, (0, pad_length), mode='constant', value=0)
 
+            if type == 'py':
+                input_audio = input_audio.tolist()
+
             context_notes.append(context_data)
             target_notes.append(tab_data)
             audio_inputs.append(input_audio)
 
-        return {
-            'audio_input': audio_inputs,
-            'context_notes': context_notes,
-            'target_notes': target_notes
-        }
+        return audio_inputs, context_notes, target_notes
 
     def stream_generator(self, start_idx: int = 0, end_idx: Optional[int] = None) -> Generator[Dict, None, None]:
         """流式生成数据"""
@@ -176,7 +179,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         return
 
     @classmethod
-    def generator_from_path(cls, mid_path:str, start = 0, limit = 1000):
+    def generator_from_path(cls, mid_path:str, start = 0, limit = 1000, type = 'pt'):
         extensions = ['.mid', '.midi', '.MID', '.MIDI']
         midi_files = []
 
@@ -199,7 +202,13 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             encoded = cls.encode_tab_sequence(dataset, song=song)
             duration = len(encoded['duration']) / 8
             wav, _ = midi_to_audio_tensor(f.__str__(), sr=dataset.sample_rate, duration=duration, debug=False)
-            yield dataset.slide_data(wav, encoded)
+            a, c, t = dataset.slide_data(wav, encoded, type=type)
+            for i in  range(len(a)):
+                yield {
+                    'audio_input': a[i],
+                    'context_notes': c[i],
+                    'target_notes': t[i]
+                }
 
 
     @classmethod

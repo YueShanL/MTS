@@ -342,11 +342,11 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
         training_log.append(log_entry)
 
         # 打印进度
-        print(f"Epoch {epoch + 1}/{num_epochs}: "
-              f"Train Loss: {train_loss:.4f}, "
-              f"Val Loss: {val_loss if val_loss else 'N/A':.4f}, "
-              f"TF Prob: {tf_prob:.2f}, "
-              f"TF/AR: {trainer.stats['tf_used']}/{trainer.stats['ar_used']}")
+        print(f'Epoch {epoch + 1}/{num_epochs}: '
+              f'Train Loss: {train_loss:.4f}, '
+              f'Val Loss: {val_loss if val_loss else "N/A":.4f}, '
+              f'TF Prob: {tf_prob:.2f}, '
+              f'TF/AR: {trainer.stats["tf_used"]}/{trainer.stats["ar_used"]}')
 
     return training_log
 
@@ -365,16 +365,17 @@ def evaluate_model(model, loss_fn, dataloader):
                 batch['target_notes'][key] = batch['target_notes'][key].to(device)
 
             # 自回归生成（模拟推理）
-            outputs = model(
+            _, logits = model(
                 audio_input=batch['audio_input'],
                 context_notes=None,
                 target_notes=None,
                 teacher_forcing=False,
-                generate_length=model.config.notes_per_bar * model.config.predict_bars
+                generate_length=model.config.notes_per_bar * model.config.predict_bars,
+                return_logits=True
             )
 
             # 计算损失
-            loss, _ = loss_fn(outputs, batch['target_notes'], device=device)
+            loss, _ = loss_fn(logits, batch['target_notes'])
             total_loss += loss.item()
 
     model.train()
