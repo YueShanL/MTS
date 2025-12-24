@@ -87,9 +87,10 @@ class MixedTrainer:
             self.stats['tf_used'] += 1
         else:
             # 混合训练前向传播
-            audio_features = self.model.encode_audio(batch['audio_input'])
+            '''audio_features = self.model.encode_audio(batch['audio_input'])
             memory = self.model.fusion_encoder(audio_features)
-            outputs = self.mixed_forward(memory, batch['target_notes'], teacher_forcing_prob)
+            outputs = self.mixed_forward(memory, batch['target_notes'], teacher_forcing_prob)'''
+            _, outputs = self.model(**batch, teacher_forcing=False, generate_length=64, return_logits=True)
             self.stats['ar_used'] += 1
 
         # 计算损失
@@ -323,6 +324,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
 
     # 初始化组件
     config = model.config
+
     loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=False)
     trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size,scheduler_type= scheduler_type)
 

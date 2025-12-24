@@ -88,7 +88,6 @@ class MTSGen(PreTrainedModel):
         # 输出头
         self.duration_head = nn.Linear(config.hidden_size, config.num_durations)
 
-        # 每根弦独立的输出头
         self.fret_classes_per_string = config.max_fret + 2
         self.fret_heads = nn.ModuleList([
             nn.Linear(config.hidden_size, self.fret_classes_per_string)
@@ -105,7 +104,7 @@ class MTSGen(PreTrainedModel):
 
         # 初始化权重
         self.apply(self._init_weights)
-        print(f"模型初始化完成，每根弦独立输出品位和技巧")
+        print(f"模型初始化完成")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -124,7 +123,6 @@ class MTSGen(PreTrainedModel):
         """编码音频特征 - 适配EnCodec"""
         with torch.set_grad_enabled(not self.config.freeze_encoder):
             # ============ 方案一：使用编码器的连续特征（推荐） ============
-            # 这种方式与Wav2Vec2的输出最相似，都是连续特征
             with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
                 # 直接调用编码器获取连续特征，而非使用encode()
                 # audio_input形状应为 [B, 1, T]
@@ -136,57 +134,12 @@ class MTSGen(PreTrainedModel):
 
             # 确保特征为浮点类型
             audio_features = audio_features.float()
-            # ============================================================
-
-            # ============ 方案二：使用量化编码的嵌入（备选） ============
-            # 如果你想利用EnCodec的量化特性，可以这样处理：
-            # with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
-            #     # 获取量化编码
-            #     encoded_frames = self.audio_encoder.encode(audio_input)
-            #
-            #     # encoded_frames[0] 是编码列表，每个元素形状为 [B, K, T]
-            #     # 其中 K 是量化器数量，T 是时间步
-            #     if encoded_frames and len(encoded_frames[0]) > 0:
-            #         # 取最后一个量化器的编码（最高质量）
-            #         # 或者将所有量化器的编码取平均/拼接
-            #         codes = encoded_frames[0][-1]  # [B, 1, T]
-            #
-            #         # 需要为量化编码创建嵌入层（在__init__中定义）
-            #         # self.code_embedding = nn.Embedding(num_codebooks, encoder_output_dim)
-            #         audio_features = self.code_embedding(codes)  # [B, T, 1, D]
-            #         audio_features = audio_features.squeeze(2)   # [B, T, D]
-            # ============================================================
 
             # 投影到模型隐藏维度
             audio_features = self.audio_projection(audio_features)
 
             # 时间对齐适配
             return self.temporal_adapter(audio_features)
-
-    def add_attention_hooks(self, decoder):
-        """
-        为TransformerDecoder的所有层添加注意力钩子。
-        """
-        attention_weights = {}  # 用于存储各层权重
-
-        def get_attention_hook(layer_idx, attn_type):
-            def hook(module, input, output):
-                # output 是 (attn_output, attn_weights) 元组（当need_weights=True时）
-                if isinstance(output, tuple) and len(output) == 2:
-                    attn_output, attn_weights = output
-                    key = f'layer_{layer_idx}_{attn_type}'
-                    attention_weights[key] = attn_weights.detach()
-
-            return hook
-
-        # 为每一层的自注意力和交叉注意力注册钩子
-        for i, layer in enumerate(decoder.layers):
-            # 注册自注意力钩子
-            layer.self_attn.register_forward_hook(get_attention_hook(i, 'self'))
-            # 注册交叉注意力钩子
-            layer.multihead_attn.register_forward_hook(get_attention_hook(i, 'cross'))
-
-        return attention_weights
 
     def forward(
         self,
@@ -290,6 +243,7 @@ class MTSGen(PreTrainedModel):
             如果return_logits=False: 返回预测字典 {'duration': [B, L], 'fret': [B, L, S], ...}
             如果return_logits=True: 返回元组 (predictions, logits)
         """
+
         batch_size = memory.shape[0]
         device = memory.device
         
@@ -299,8 +253,6 @@ class MTSGen(PreTrainedModel):
             torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
 
-        #attention_weights_container = self.add_attention_hooks(self.autoregressive_decoder)
-
 
         # 存储结果
         all_predictions = {'duration': [], 'fret': [], 'technique': []}
@@ -308,38 +260,16 @@ class MTSGen(PreTrainedModel):
         
         # 生成循环
         for step in range(generate_length):
-            current_input = F.layer_norm(current_input, (current_input.size(-1),))
-
             # 解码当前步
             seq_len = current_input.shape[1]
             tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
+
             
             decoder_output = self.autoregressive_decoder(current_input, memory, tgt_mask)
 
-            '''if step < 3 or step % 10 == 0:  # 只检查前几步
-                # 假设你的解码器层可以返回注意力权重
-                # 或者修改模型以返回注意力
-                print(f"\n=== Step {step} 注意力诊断 ===")
-                for key, attn_weights in attention_weights_container.items():
-                    if attn_weights is not None:
-                        # 计算统计量
-                        attn_mean = attn_weights.mean().item()
-                        attn_std = attn_weights.std().item()
-
-                        # 计算注意力分布的熵（沿着source_len维度）
-                        # attn_weights形状: [batch, num_heads, target_len, source_len]
-                        attn_flat = attn_weights.view(-1, attn_weights.size(-1))
-                        attn_entropy = -torch.sum(attn_flat * torch.log(attn_flat + 1e-8), dim=-1).mean().item()
-
-                        print(f"{key}: mean={attn_mean:.4f}, std={attn_std:.4f}, 熵={attn_entropy:.4f}")
-
-                        # 关键诊断：检查注意力是否坍缩
-                        if attn_std < 0.01:
-                            print(f"  ⚠️  {key} 注意力权重几乎一致，可能已失效！")'''
-
 
             last_output = decoder_output[:, -1:, :]
-            last_output = self.output_norm(last_output)
+            #last_output = self.output_norm(last_output)
             
             # 计算logits
             step_logits = self._compute_outputs(last_output)
@@ -591,17 +521,16 @@ class MixedTrainingForward:
 # ============ 测试代码 ============
 def main():
     """测试主函数"""
-    config = MTSGenConfig.mtsGen_300m_depth()
+    config = MTSGenConfig.mtsGen_150m()
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'best_model_epoch2.pth'))
+    model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     dataset_path = "../output/Model/dataset"
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
-    #dataset = AudioGuitarTabDataset(dataset['audio_input'], dataset['target_notes'])
     sample = dataset[random.randint(0, len(dataset) - 1)]
 
     # 测试数据
@@ -658,7 +587,7 @@ def main():
     with torch.no_grad():
         generate_outputs, logits = model(
             audio_input=dummy_audio,
-            #context_notes=dummy_context,
+            context_notes=dummy_context,
             teacher_forcing=False,
             generate_length=64,
             do_sample=True,
