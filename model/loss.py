@@ -53,19 +53,68 @@ class AutoregressiveMultiTaskLoss(nn.Module):
             self._init_focal_losses()
 
     def _setup_class_weights(self, alpha_scale):
-        """设置吉他任务特定的权重"""
-        # Duration
+        """设置吉他任务特定的权重 - 基于真实数据分布优化"""
+
+        # ============ Duration权重 ============
+        # 你的数据：0:48.7%, 1:1.1%, 2:1.3%, 3:2.5%, 4:3.0%, 5:7.2%, 6:8.2%, 7:14.8%, 9:13.1%
+        # 策略：大幅惩罚休止符(0)，鼓励其他持续时间
         self.duration_alpha = torch.ones(self.config.num_durations).to(self.device)
-        self.duration_alpha[0] = 1.5  # 休止符权重最高
 
-        # Fret
+        # 设置具体权重（根据频率反比调整）
+        dur_weights = {
+            0: 0.05,   # 休止符：48.7% -> 权重0.05 (强烈惩罚)
+            1: 3.5,    # 非常罕见但重要的时值：1.1% -> 权重3.5 (高奖励)
+            2: 3.0,    # 1.3% -> 权重3.0
+            3: 2.0,    # 2.5% -> 权重2.0
+            4: 1.5,    # 3.0% -> 权重1.5
+            5: 0.8,    # 7.2% -> 权重0.8
+            6: 0.7,    # 8.2% -> 权重0.7
+            7: 0.5,    # 14.8% -> 权重0.5
+            9: 0.6,    # 13.1% -> 权重0.6
+        }
+
+        for idx, weight in dur_weights.items():
+            if idx < self.config.num_durations:
+                self.duration_alpha[idx] = weight
+
+        print(f"Duration权重设置: 休止符(0)->{dur_weights[0]:.2f}, 1->{dur_weights[1]:.2f}, ...")
+
+        # ============ Fret权重 ============
+        # 你的数据：fret 25(不演奏)占77.4%，真实品位(0-24)共占22.6%
+        # 策略：极度惩罚"不演奏"，大幅提升真实品位权重
         self.fret_alpha = torch.ones(self.config.max_fret + 2).to(self.device)
-        self.fret_alpha[-1] = 0.3
 
+        # 不演奏标记(fret 25)极度惩罚
+        self.fret_alpha[-1] = 0.08  # 77.4% -> 权重0.08
 
-        # Technique
+        # 真实品位权重策略：
+        # 1. 常用低把位(0-12)：中等奖励（频率相对较高）
+        # 2. 高把位(13-24)：高额奖励（更稀有）
+
+        # 常用低把位(0-12)：权重1.5-2.5
+        for i in range(0, 13):
+            if i == 0:  # 空弦
+                self.fret_alpha[i] = 2.0
+            elif i in [5, 7, 12]:  # 常用品位
+                self.fret_alpha[i] = 1.5
+            else:
+                self.fret_alpha[i] = 2.0
+
+        # 高把位(13-24)：更高的奖励（更稀有）
+        for i in range(13, 25):
+            if i == 23:  # 你的数据显示23品有3.9%，相对较高
+                self.fret_alpha[i] = 1.0
+            else:
+                self.fret_alpha[i] = 3.0  # 其他高把位给高奖励
+
+        # 特殊：根据你的实际数据调整某些品位的权重
+        # 例如，你的数据显示fret 23有3.9%，已经做了处理
+
+        print(f"Fret权重设置: 不演奏(25)->{self.fret_alpha[-1]:.2f}, 空弦(0)->{self.fret_alpha[0]:.2f}, 高把位(20)->{self.fret_alpha[20]:.2f}")
+
+        # ============ Technique权重 ============
+        # 暂时保持均匀，可根据实际分布调整
         self.technique_alpha = torch.ones(self.config.num_techniques).to(self.device)
-        #self.technique_alpha[0] = 0.6
 
     def _init_focal_losses(self):
         """初始化Focal Loss实例"""

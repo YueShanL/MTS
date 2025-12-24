@@ -595,7 +595,7 @@ def main():
 
     # 创建模型
     model = MTSGen(config)
-    #model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
+    model.load_state_dict(torch.load(f'best_model_epoch2.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -661,14 +661,14 @@ def main():
             #context_notes=dummy_context,
             teacher_forcing=False,
             generate_length=64,
-            do_sample=False,
+            do_sample=True,
             return_logits=True
         )
 
         for key, value in logits.items():
             if value is not None:
                 print(f"  {key}: {value.shape}")
-    loss = AutoregressiveMultiTaskLoss(config, use_focal=True, device = 'cpu')
+    loss = AutoregressiveMultiTaskLoss(config, use_focal=False, device = 'cpu')
     print(loss(logits, dummy_context))
     sample = {}
     for key, value in generate_outputs.items():

@@ -59,19 +59,22 @@ class MixedTrainer:
         )'''
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=1e-4,  # 从1e-5/1e-4/5e-4统一为更小的值
+            lr=3e-5,  # 从1e-5/1e-4/5e-4统一为更小的值
             weight_decay=0.01,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.999),
+            eps = 1e-8
         )
         
         # 使用warmup策略
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=2e-4,  # 峰值学习率
+            max_lr=5e-5,  # 峰值学习率
             epochs=self.epoches,
             steps_per_epoch=self.epochs_len,
-            pct_start=0.1,  # 10%的时间用于warmup
-            anneal_strategy='cos'
+            pct_start=0.15,  # 15%的时间用于warmup
+            anneal_strategy='linear',
+            div_factor=25.0,  # 初始lr = max_lr/25
+            final_div_factor=10000.0  # 最终lr = max_lr/10000
         )
 
     def train_step(self, batch, teacher_forcing_prob):
@@ -95,7 +98,8 @@ class MixedTrainer:
         # 反向传播
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        #torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
         self.optimizer.step()
 
         return loss.item(), details
@@ -319,7 +323,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
 
     # 初始化组件
     config = model.config
-    loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=True)
+    loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=False)
     trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size,scheduler_type= scheduler_type)
 
     # 创建数据加载器
