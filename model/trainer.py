@@ -51,9 +51,25 @@ class MixedTrainer:
 
     def _setup_optimizer(self):
         """设置优化器"""
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        '''self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
         self.scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', patience=3, factor=0.5
+        )'''
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=1e-4,  # 从1e-5/1e-4/5e-4统一为更小的值
+            weight_decay=0.01,
+            betas=(0.9, 0.999)
+        )
+        
+        # 使用warmup策略
+        self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=2e-4,  # 峰值学习率
+            epochs=self.config.num_epochs,
+            steps_per_epoch=len(self.train_loader),
+            pct_start=0.1,  # 10%的时间用于warmup
+            anneal_strategy='cos'
         )
 
     def train_step(self, batch, teacher_forcing_prob):
@@ -296,12 +312,12 @@ def collate_fn(batch):
         return batched
 
 def train_mixed_model(model, train_dataset, val_dataset=None,
-                      num_epochs=10, batch_size=8, scheduler_type='linear'):
+                      num_epochs=10, batch_size=8, scheduler_type='linear', output_path='.'):
     """完整的混合训练循环"""
 
     # 初始化组件
     config = model.config
-    loss_fn = AutoregressiveMultiTaskLoss(config)
+    loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=True)
     trainer = MixedTrainer(model, loss_fn, config, scheduler_type)
 
     # 创建数据加载器
@@ -328,7 +344,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
             # 保存最佳模型
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), f'best_model_epoch{epoch}.pth')
+                torch.save(model.state_dict(), f'{output_path}/best_model_epoch{epoch}.pth')
 
         # 记录日志
         log_entry = {

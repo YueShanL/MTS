@@ -60,8 +60,6 @@ class AutoregressiveMultiTaskLoss(nn.Module):
 
         # Fret
         self.fret_alpha = torch.ones(self.config.max_fret + 2).to(self.device)
-        '''for i in range(self.config.max_fret + 1):
-            self.fret_alpha[i] = i ** 0.5'''
         self.fret_alpha[-1] = 0.3
 
 

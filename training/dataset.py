@@ -13,7 +13,7 @@ class MusicGenMelodyDataset(Dataset):
             self,
             dataset: Dataset,
             processor: AutoProcessor.from_pretrained,
-            dataset_len: int = 1000,
+            dataset_len: int = 50,
             max_length: int = 30 * 32000,  # ~30 seconds at 32kHz
             sampling_rate: int = 32000,
             sliding_window: int = 10 * 32000
