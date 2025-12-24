@@ -370,7 +370,7 @@ def evaluate_model(model, loss_fn, dataloader):
                 context_notes=None,
                 target_notes=None,
                 teacher_forcing=False,
-                generate_length=model.config.notes_per_bar * model.config.predict_bars,
+                generate_length=64,
                 return_logits=True
             )
 

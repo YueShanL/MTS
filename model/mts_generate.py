@@ -13,6 +13,7 @@ from transformers import PreTrainedModel, EncodecModel
 
 from model.dataset import decode
 from model.focal_loss import FocalLoss
+from model.loss import AutoregressiveMultiTaskLoss
 from model.mts_config import MTSGenConfig
 from model.preprocess import TemporalAdapter, NoteEmbedding, PositionalEncoding
 
@@ -162,6 +163,30 @@ class MTSGen(PreTrainedModel):
             # 时间对齐适配
             return self.temporal_adapter(audio_features)
 
+    def add_attention_hooks(self, decoder):
+        """
+        为TransformerDecoder的所有层添加注意力钩子。
+        """
+        attention_weights = {}  # 用于存储各层权重
+
+        def get_attention_hook(layer_idx, attn_type):
+            def hook(module, input, output):
+                # output 是 (attn_output, attn_weights) 元组（当need_weights=True时）
+                if isinstance(output, tuple) and len(output) == 2:
+                    attn_output, attn_weights = output
+                    key = f'layer_{layer_idx}_{attn_type}'
+                    attention_weights[key] = attn_weights.detach()
+
+            return hook
+
+        # 为每一层的自注意力和交叉注意力注册钩子
+        for i, layer in enumerate(decoder.layers):
+            # 注册自注意力钩子
+            layer.self_attn.register_forward_hook(get_attention_hook(i, 'self'))
+            # 注册交叉注意力钩子
+            layer.multihead_attn.register_forward_hook(get_attention_hook(i, 'cross'))
+
+        return attention_weights
 
     def forward(
         self,
@@ -273,18 +298,46 @@ class MTSGen(PreTrainedModel):
         current_input = current_input + self.positional_encoding.position_embeddings(
             torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
-        
+
+        #attention_weights_container = self.add_attention_hooks(self.autoregressive_decoder)
+
+
         # 存储结果
         all_predictions = {'duration': [], 'fret': [], 'technique': []}
         all_logits = {'duration': [], 'fret': [], 'technique': []} if return_logits else None
         
         # 生成循环
         for step in range(generate_length):
+            current_input = F.layer_norm(current_input, (current_input.size(-1),))
+
             # 解码当前步
             seq_len = current_input.shape[1]
             tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
             
             decoder_output = self.autoregressive_decoder(current_input, memory, tgt_mask)
+
+            '''if step < 3 or step % 10 == 0:  # 只检查前几步
+                # 假设你的解码器层可以返回注意力权重
+                # 或者修改模型以返回注意力
+                print(f"\n=== Step {step} 注意力诊断 ===")
+                for key, attn_weights in attention_weights_container.items():
+                    if attn_weights is not None:
+                        # 计算统计量
+                        attn_mean = attn_weights.mean().item()
+                        attn_std = attn_weights.std().item()
+
+                        # 计算注意力分布的熵（沿着source_len维度）
+                        # attn_weights形状: [batch, num_heads, target_len, source_len]
+                        attn_flat = attn_weights.view(-1, attn_weights.size(-1))
+                        attn_entropy = -torch.sum(attn_flat * torch.log(attn_flat + 1e-8), dim=-1).mean().item()
+
+                        print(f"{key}: mean={attn_mean:.4f}, std={attn_std:.4f}, 熵={attn_entropy:.4f}")
+
+                        # 关键诊断：检查注意力是否坍缩
+                        if attn_std < 0.01:
+                            print(f"  ⚠️  {key} 注意力权重几乎一致，可能已失效！")'''
+
+
             last_output = decoder_output[:, -1:, :]
             last_output = self.output_norm(last_output)
             
@@ -538,11 +591,11 @@ class MixedTrainingForward:
 # ============ 测试代码 ============
 def main():
     """测试主函数"""
-    config = MTSGenConfig.mtsGen_150m()
+    config = MTSGenConfig.mtsGen_300m_depth()
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
+    #model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -603,18 +656,20 @@ def main():
     print("\n测试生成模式:")
     model.eval()
     with torch.no_grad():
-        generate_outputs = model(
+        generate_outputs, logits = model(
             audio_input=dummy_audio,
-            context_notes=dummy_context,
+            #context_notes=dummy_context,
             teacher_forcing=False,
             generate_length=64,
-            do_sample=True
+            do_sample=False,
+            return_logits=True
         )
 
-        for key, value in generate_outputs.items():
+        for key, value in logits.items():
             if value is not None:
                 print(f"  {key}: {value.shape}")
-
+    loss = AutoregressiveMultiTaskLoss(config, use_focal=True, device = 'cpu')
+    print(loss(logits, dummy_context))
     sample = {}
     for key, value in generate_outputs.items():
         if value is not None:
@@ -627,6 +682,8 @@ def main():
     gp.write(target, 'target.gp5')
 
     print(song)
+
+
 
 
 

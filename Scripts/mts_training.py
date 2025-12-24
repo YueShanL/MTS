@@ -11,7 +11,7 @@ from model.mts_config import MTSGenConfig
 from model.mts_generate import MTSGen
 from model.trainer import train_mixed_model
 
-linux = 1
+linux = 0
 debug = 0
 if __name__ == '__main__':
     dataset_path = "output/Model/dataset" if linux else "../output/Model/dataset"
@@ -19,7 +19,7 @@ if __name__ == '__main__':
     piast_yt = "data/dataset/PIAST/piast_yt/midi" if linux else "../data/dataset/PIAST/piast_yt/midi"
 
     generating_dataset = False
-    dataset_length = 2000
+    dataset_length = 400
     current_length = 0
 
     try:
@@ -101,7 +101,7 @@ if __name__ == '__main__':
                 shutil.rmtree(temp_dir)
 
         # 加载最终数据集
-        dataset = Dataset.load_from_disk(dataset_path)
+    dataset = Dataset.load_from_disk(dataset_path).select(range(min(dataset_length, 50)))
     #Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
 
 
@@ -110,9 +110,9 @@ if __name__ == '__main__':
     seed=42,        # 随机种子
     shuffle=True    # 是否打乱
     )
-    config = MTSGenConfig.mtsGen_300m_depth()
+    config = MTSGenConfig.mtsGen_150m()
     model = MTSGen(config)
     #model.load_state_dict(torch.load(f'checkpoint_epoch_20.pt')['model_state_dict'])
     model.to('cuda')
     train_mixed_model(model, train_val_split['train'], val_dataset=train_val_split['test'],
-                          num_epochs=5, batch_size=16)
+                          num_epochs=5, batch_size=8)
