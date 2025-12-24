@@ -38,7 +38,9 @@ class TrainingConfig:
 class MixedTrainer:
     """简洁的混合训练器"""
 
-    def __init__(self, model, loss_fn, config, scheduler_type='linear'):
+    def __init__(self, model, loss_fn, config, epoches = 8, epochs_len=4000//8, scheduler_type='linear'):
+        self.epochs_len = epochs_len
+        self.epoches = epoches
         self.model = model
         self.loss_wrapper = LossWrapper(loss_fn)
         self.config = config
@@ -66,8 +68,8 @@ class MixedTrainer:
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=2e-4,  # 峰值学习率
-            epochs=self.config.num_epochs,
-            steps_per_epoch=len(self.train_loader),
+            epochs=self.epoches,
+            steps_per_epoch=self.epochs_len,
             pct_start=0.1,  # 10%的时间用于warmup
             anneal_strategy='cos'
         )
@@ -318,7 +320,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
     # 初始化组件
     config = model.config
     loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=True)
-    trainer = MixedTrainer(model, loss_fn, config, scheduler_type)
+    trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size,scheduler_type= scheduler_type)
 
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
