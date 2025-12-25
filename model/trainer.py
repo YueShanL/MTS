@@ -58,29 +58,29 @@ class MixedTrainer:
     def _setup_optimizer(self):
         """设置优化器"""
         '''self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
-        self.scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=3, factor=0.5
-        )'''
+        '''
+
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=1e-4,  # 从1e-5/1e-4/5e-4统一为更小的值
             weight_decay=0.01,
             betas=(0.9, 0.999),
-            eps = 1e-8
+            eps=1e-8
         )
-        
-        # 使用warmup策略
+        self.scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=3, factor=0.5
+        )
+        '''# 使用warmup策略
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=1e-4,  # 峰值学习率
             epochs=self.epoches,
             steps_per_epoch=self.epochs_len,
-            pct_start=0.1,  # 15%的时间用于warmup
+            pct_start=0.10,  # 10%的时间用于warmup
             anneal_strategy='linear',
-            div_factor=1.0,  # 初始lr = max_lr/25
+            div_factor=1,  # 初始lr = max_lr/25
             final_div_factor=1000.0  # 最终lr = max_lr/10000
-        )
-
+        )'''
     def train_step(self, batch, teacher_forcing_prob):
         """单步训练"""
         # 选择训练模式
