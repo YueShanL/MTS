@@ -1,7 +1,11 @@
 import math
+import os
 import random
 
+import numpy as np
+import pandas as pd
 import torch
+from matplotlib import pyplot as plt
 from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -59,7 +63,7 @@ class MixedTrainer:
         )'''
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=3e-5,  # 从1e-5/1e-4/5e-4统一为更小的值
+            lr=1e-4,  # 从1e-5/1e-4/5e-4统一为更小的值
             weight_decay=0.01,
             betas=(0.9, 0.999),
             eps = 1e-8
@@ -68,13 +72,13 @@ class MixedTrainer:
         # 使用warmup策略
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=5e-5,  # 峰值学习率
+            max_lr=1e-4,  # 峰值学习率
             epochs=self.epoches,
             steps_per_epoch=self.epochs_len,
-            pct_start=0.15,  # 15%的时间用于warmup
+            pct_start=0.1,  # 15%的时间用于warmup
             anneal_strategy='linear',
-            div_factor=25.0,  # 初始lr = max_lr/25
-            final_div_factor=10000.0  # 最终lr = max_lr/10000
+            div_factor=1.0,  # 初始lr = max_lr/25
+            final_div_factor=1000.0  # 最终lr = max_lr/10000
         )
 
     def train_step(self, batch, teacher_forcing_prob):
@@ -106,23 +110,50 @@ class MixedTrainer:
         return loss.item(), details
 
     def train_epoch(self, dataloader, epoch, total_epochs):
-        """训练一个epoch"""
+        """训练一个epoch，返回平均损失、教师强制概率和loss记录DataFrame"""
         self.model.train()
         teacher_forcing_prob = self.scheduler.get_prob(epoch, total_epochs)
         total_loss = 0
+
+        # 用于收集loss信息的列表
+        loss_records = []
+
         progress_bar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{total_epochs}')
 
         for batch_idx, batch in enumerate(progress_bar):
             batch = self._move_to_device(batch)
-            loss, _ = self.train_step(batch, teacher_forcing_prob)
+            loss, details = self.train_step(batch, teacher_forcing_prob)
             total_loss += loss
 
-            progress_bar.set_postfix({'loss': f'{loss:.4f}'})
+            # 收集loss信息
+            record = {
+                'epoch': epoch + 1,
+                'batch': batch_idx + 1,
+                'total_loss': loss,
+                'teacher_forcing_prob': teacher_forcing_prob,
+            }
+
+            loss_records.append(record)
+
+            # 更新进度条
+            postfix_info = {'loss': f'{loss:.4f}', 'tf_prob': f'{teacher_forcing_prob:.3f}'}
+            if isinstance(details, dict):
+                for key, value in details.items():
+                    if isinstance(value, torch.Tensor):
+                        postfix_info[key] = f'{value.item():.4f}'
+                    else:
+                        postfix_info[key] = f'{value:.4f}'
+            progress_bar.set_postfix(postfix_info)
+
+            # 更新学习率（OneCycleLR需要在每个batch后step）
+            self.scheduler_lr.step()
 
         avg_loss = total_loss / len(dataloader)
-        self.scheduler_lr.step(avg_loss)
 
-        return avg_loss, teacher_forcing_prob
+        # 创建DataFrame
+        loss_df = pd.DataFrame(loss_records)
+
+        return avg_loss, teacher_forcing_prob, loss_df
 
     def _move_to_device(self, batch):
         """移动批次数据到设备"""
@@ -326,7 +357,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
     config = model.config
 
     loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=False)
-    trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size,scheduler_type= scheduler_type)
+    trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size + 1,scheduler_type= scheduler_type)
 
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
@@ -338,11 +369,12 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
 
     # 训练循环
     training_log = []
+    all_batch_losses = []
     best_val_loss = float('inf')
 
     for epoch in range(num_epochs):
         # 训练
-        train_loss, tf_prob = trainer.train_epoch(train_loader, epoch, num_epochs)
+        train_loss, tf_prob, loss_df = trainer.train_epoch(train_loader, epoch, num_epochs)
 
         # 验证
         val_loss = None
@@ -364,6 +396,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
             'ar_used': trainer.stats['ar_used']
         }
         training_log.append(log_entry)
+        all_batch_losses.extend(loss_df['total_loss'])
 
         # 打印进度
         print(f'Epoch {epoch + 1}/{num_epochs}: '
@@ -371,6 +404,9 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
               f'Val Loss: {val_loss if val_loss else "N/A":.4f}, '
               f'TF Prob: {tf_prob:.2f}, '
               f'TF/AR: {trainer.stats["tf_used"]}/{trainer.stats["ar_used"]}')
+
+    if all_batch_losses:
+        _generate_loss_plot(all_batch_losses, output_path)
 
     return training_log
 
@@ -404,3 +440,23 @@ def evaluate_model(model, loss_fn, dataloader):
 
     model.train()
     return total_loss / len(dataloader)
+
+
+def _generate_loss_plot(all_losses, output_path):
+    """生成loss图表"""
+    plt.figure(figsize=(10, 6))
+
+    # 绘制loss曲线
+    plt.plot(all_losses, 'b-', linewidth=1.5, alpha=0.8)
+
+    plt.xlabel('Training Step', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('Training Loss', fontsize=14)
+    plt.grid(True, alpha=0.3)
+
+    # 保存图表
+    plot_path = os.path.join(output_path, 'loss_plot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Loss plot saved to: {plot_path}")
