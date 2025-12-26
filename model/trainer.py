@@ -67,8 +67,12 @@ class MixedTrainer:
             betas=(0.9, 0.999),
             eps=1e-8
         )
-        self.scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        '''self.scheduler_lr = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', patience=3, factor=0.5
+        )'''
+        self.scheduler_lr = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer,
+            lr_lambda=lambda epoch: min((epoch + 1) / 10, 1.0)  # 前10个epoch预热
         )
         '''# 使用warmup策略
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
@@ -103,8 +107,7 @@ class MixedTrainer:
         # 反向传播
         self.optimizer.zero_grad()
         loss.backward()
-        #torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
         return loss.item(), details
@@ -141,14 +144,13 @@ class MixedTrainer:
                 for key, value in details.items():
                     if isinstance(value, torch.Tensor):
                         postfix_info[key] = f'{value.item():.4f}'
-                    else:
-                        postfix_info[key] = f'{value:.4f}'
+                    #else:
+                        #postfix_info[key] = f'{value:.4f}'
             progress_bar.set_postfix(postfix_info)
 
-            # 更新学习率（OneCycleLR需要在每个batch后step）
-            self.scheduler_lr.step()
 
         avg_loss = total_loss / len(dataloader)
+        self.scheduler_lr.step(avg_loss)
 
         # 创建DataFrame
         loss_df = pd.DataFrame(loss_records)
@@ -401,7 +403,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
         # 打印进度
         print(f'Epoch {epoch + 1}/{num_epochs}: '
               f'Train Loss: {train_loss:.4f}, '
-              f'Val Loss: {val_loss if val_loss else "N/A":.4f}, '
+              f'Val Loss: {val_loss if val_loss else "N/A"}, '
               f'TF Prob: {tf_prob:.2f}, '
               f'TF/AR: {trainer.stats["tf_used"]}/{trainer.stats["ar_used"]}')
 

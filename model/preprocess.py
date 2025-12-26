@@ -1,18 +1,28 @@
+import math
 from typing import Dict
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class TemporalAdapter(nn.Module):
-    """时间对齐适配器"""
-
     def __init__(self, input_dim, target_rate, audio_rate):
         super().__init__()
-        self.upsample = nn.Upsample(scale_factor=target_rate / audio_rate, mode='linear')
+        self.scale_factor = target_rate / audio_rate
+
+        # 使用插值代替 Upsample
+        self.align = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.ReLU()
+        )
 
     def forward(self, x):
-        return self.upsample(x.transpose(1, 2)).transpose(1, 2)
+        # x: [B, T, D]
+        # 在时间维度上进行插值
+        x = x.transpose(1, 2)  # [B, D, T]
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode='linear', align_corners=False)
+        return x.transpose(1, 2)
 
 
 class NoteEmbedding(nn.Module):
@@ -63,12 +73,84 @@ class NoteEmbedding(nn.Module):
         print(f"NoteEmbeddingSimple维度: total={total_embed_dim}, hidden_size={config.hidden_size}")
 
         # 线性层融合所有特征
-        self.feature_fusion = nn.Sequential(
+        '''self.feature_fusion = nn.Sequential(
             nn.Linear(total_embed_dim, total_embed_dim * 2),
             nn.ReLU(),
             nn.Linear(total_embed_dim * 2, config.hidden_size)
+        )'''
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(total_embed_dim, total_embed_dim * 2),
+            nn.LayerNorm(total_embed_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(total_embed_dim * 2, config.hidden_size)
         )
 
+    '''def forward(self, notes: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_size, seq_len = notes['duration'].shape
+
+        # 1. 嵌入 duration
+        duration_indices = notes['duration'].long()
+        pad_mask = (duration_indices == -100)
+        duration_indices_clamped = duration_indices.masked_fill(pad_mask, 0)
+        duration_emb = self.duration_embedding(duration_indices_clamped)
+        duration_emb = duration_emb.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+
+        # 2. 嵌入 fret 和 technique
+        fret_indices = notes['fret'].long()  # [B, L, 6]
+        tech_indices = notes['technique'].long()
+
+        # 创建统一掩码
+        string_pad_mask = (fret_indices == -100)  # [B, L, 6]
+
+        # 处理 fret 嵌入
+        fret_indices_clamped = fret_indices.masked_fill(string_pad_mask, 0)
+        fret_emb_flat = self.fret_embedding(fret_indices_clamped.view(-1))
+        fret_emb = fret_emb_flat.view(batch_size, seq_len, self.config.num_strings, -1)
+        fret_emb = fret_emb.masked_fill(string_pad_mask.unsqueeze(-1), 0.0)
+
+        # 处理 technique 嵌入
+        tech_indices_clamped = tech_indices.masked_fill(string_pad_mask, 0)
+        tech_emb_flat = self.technique_embedding(tech_indices_clamped.view(-1))
+        tech_emb = tech_emb_flat.view(batch_size, seq_len, self.config.num_strings, -1)
+        tech_emb = tech_emb.masked_fill(string_pad_mask.unsqueeze(-1), 0.0)
+
+        # 3. 应用弦间注意力（修正部分）
+        # 拼接 fret 和 technique 特征
+        string_features = torch.cat([fret_emb, tech_emb], dim=-1)  # [B, L, 6, 64]
+
+        # 重塑为注意力需要的形状: [B*L, 6, 64]
+        B, L, S, D = string_features.shape
+        string_features = string_features.view(B * L, S, D)
+
+        # 创建注意力掩码
+        attn_mask = string_pad_mask.view(B * L, S)  # [B*L, 6]
+
+        # 应用自注意力
+        attn_output, _ = self.string_attention(
+            string_features, string_features, string_features,
+            key_padding_mask=attn_mask
+        )
+
+        # 残差连接 + 层归一化
+        string_features = string_features + attn_output
+        string_features = self.norm1(string_features)
+
+        # 前馈网络
+        ffn_output = self.ffn(string_features)
+        string_features = string_features + ffn_output
+        string_features = self.norm2(string_features)
+
+        # 展平弦维度
+        string_features = string_features.view(B, L, -1)  # [B, L, 384]
+
+        # 4. 拼接所有特征
+        combined = torch.cat([duration_emb, string_features], dim=-1)  # [B, L, 512]
+
+        # 5. 特征融合
+        embeddings = self.feature_fusion(combined)
+
+        return embeddings'''
     def forward(self, notes: Dict[str, torch.Tensor]) -> torch.Tensor:
         batch_size, seq_len = notes['duration'].shape
 
@@ -122,34 +204,26 @@ class NoteEmbedding(nn.Module):
 class PositionalEncoding(nn.Module):
     """绝对位置编码"""
 
-    def __init__(self, hidden_size, max_position=512):
+    def __init__(self, hidden_size, max_position=2048, dropout=0.1):
         super().__init__()
-        self.hidden_size = hidden_size
-        # 可学习的位置嵌入
-        self.position_embeddings = nn.Embedding(max_position, hidden_size)
-        # 可选：保持一个固定的正弦余弦编码作为基础
-        self.register_buffer('inv_freq', 1.0 / (10000 ** (torch.arange(0.0, hidden_size, 2.0) / hidden_size)))
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x, position_ids=None):
-        """
-        x: [batch, seq_len, hidden]
-        返回: [batch, seq_len, hidden*2] 或同维度
-        """
-        seq_len = x.size(1)
-        device = x.device
+        # 正弦余弦位置编码
+        pe = torch.zeros(max_position, hidden_size)
+        position = torch.arange(0, max_position, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, hidden_size, 2).float() *
+            (-math.log(10000.0) / hidden_size)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_position, hidden_size]
+        self.register_buffer('pe', pe)
 
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
-            position_ids = position_ids.unsqueeze(0).expand(x.size(0), -1)
+        # 可学习的缩放参数
+        self.scale = nn.Parameter(torch.ones(1))
 
-        # 方法A：拼接位置编码（维度加倍，需要调整后续投影）
-        pos_emb = self.position_embeddings(position_ids)  # [batch, seq, hidden]
-        # return torch.cat([x, pos_emb], dim=-1)  # 维度变为 hidden*2
-
-        # 方法B：增强的加性编码（幅度更大）
-        pos_emb = pos_emb * 2.0  # 放大位置编码的强度
-        return x + pos_emb
-
-    def get_embeddings(self, position_ids):
-        """获取位置编码（用于自回归生成）"""
-        return self.position_embeddings(position_ids) * 2.0
+    def forward(self, x):
+        # x: [B, L, D]
+        x = x + self.scale * self.pe[:, :x.size(1)]
+        return self.dropout(x)

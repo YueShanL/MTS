@@ -107,6 +107,28 @@ class MTSGen(PreTrainedModel):
         print(f"模型初始化完成")
 
     def _init_weights(self, module):
+        """改进的权重初始化"""
+        if isinstance(module, nn.Linear):
+            # 使用Xavier初始化或Kaiming初始化
+            if module.weight.shape[0] > 1000:  # 大层
+                nn.init.xavier_uniform_(module.weight, gain=0.02)
+            else:
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0.0)
+            nn.init.constant_(module.weight, 1.0)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Parameter):
+            # 起始标记的更好初始化
+            if module is self.start_token:
+                nn.init.normal_(module.data, mean=0.0, std=0.01)  # 更小的标准差
+            else:
+                nn.init.normal_(module.data, mean=0.0, std=0.02)
+
+    '''def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if module.bias is not None:
@@ -117,9 +139,11 @@ class MTSGen(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=0.02)
         elif isinstance(module, nn.Parameter):
-            module.data.normal_(mean=0.0, std=0.02)
+            module.data.normal_(mean=0.0, std=0.02)'''
 
     def encode_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
+        if audio_input.max() > 0:
+            audio_input = nn.functional.normalize(audio_input)
         """编码音频特征 - 适配EnCodec"""
         with torch.set_grad_enabled(not self.config.freeze_encoder):
             # ============ 方案一：使用编码器的连续特征（推荐） ============
@@ -223,7 +247,71 @@ class MTSGen(PreTrainedModel):
         # 计算输出（logits）
         return self._compute_outputs(decoder_output)  # 返回logits
 
-    def _autoregressive_generate(
+    def _autoregressive_generate(self, memory: torch.Tensor, generate_length: int,
+                                 do_sample: bool = True, return_logits: bool = False):
+        batch_size = memory.shape[0]
+        device = memory.device
+
+        # 使用正确的位置索引
+        pos_embeddings = self.positional_encoding.pe[:, 0].unsqueeze(0)  # [1, 1, D]
+
+        # 初始化序列，添加正确的位置编码
+        current_input = self.start_token.expand(batch_size, 1, -1).to(device)
+        # 为起始标记添加位置0的编码
+        current_input = current_input + self.positional_encoding.scale * pos_embeddings
+
+        all_predictions = {'duration': [], 'fret': [], 'technique': []}
+        all_logits = {'duration': [], 'fret': [], 'technique': []} if return_logits else None
+
+        for step in range(generate_length):
+            # 解码当前步
+            seq_len = current_input.shape[1]
+            tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
+
+            decoder_output = self.autoregressive_decoder(current_input, memory, tgt_mask)
+            last_output = decoder_output[:, -1:, :]
+            last_output = self.output_norm(last_output)  # 取消注释，添加归一化
+
+            # 计算logits
+            step_logits = self._compute_outputs(last_output)
+
+            # 存储logits（如果需要）
+            if return_logits:
+                for key in step_logits:
+                    if key in all_logits:
+                        all_logits[key].append(step_logits[key])
+
+            # 采样预测
+            step_predictions = self._sample_next_note(step_logits, do_sample=do_sample)
+
+            # 存储预测
+            for key in step_predictions:
+                if key in all_predictions:
+                    all_predictions[key].append(step_predictions[key])
+
+            # 准备下一步输入：先嵌入，然后添加正确的位置编码
+            next_embedding = self.note_embedding(step_predictions)
+            # 添加下一步的位置编码（step+1因为已经有一个起始标记）
+            next_pos = step + 1
+            next_embedding = next_embedding + self.positional_encoding.scale * \
+                             self.positional_encoding.pe[:, next_pos:next_pos + 1]
+
+            # 拼接并归一化保持数值稳定
+            current_input = torch.cat([current_input, next_embedding], dim=1)
+            # 可选：添加层归一化保持数值范围
+            if step % 10 == 0:  # 每10步归一化一次
+                current_input = F.layer_norm(current_input,
+                                             [current_input.size(-1)])
+
+        # 合并结果
+        predictions = {k: torch.cat(v, dim=1) for k, v in all_predictions.items()}
+
+        if return_logits:
+            logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items()}
+            return predictions, logits
+        else:
+            return predictions
+    '''def _autoregressive_generate(
         self, 
         memory: torch.Tensor, 
         generate_length: int,
@@ -249,7 +337,7 @@ class MTSGen(PreTrainedModel):
         
         # 初始化序列
         current_input = self.start_token.expand(batch_size, 1, -1).to(device)
-        current_input = current_input + self.positional_encoding.position_embeddings(
+        current_input = current_input + self.positional_encoding(
             torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
 
@@ -290,8 +378,8 @@ class MTSGen(PreTrainedModel):
             
             # 准备下一步输入
             next_embedding = self.note_embedding(step_predictions)
-            next_embedding = next_embedding + self.positional_encoding.position_embeddings(
-                torch.full((batch_size, 1), seq_len, dtype=torch.long, device=device)
+            next_embedding = next_embedding + self.positional_encoding(
+                torch.full((batch_size, 1, 1), seq_len, dtype=torch.long, device=device)
             )
             current_input = torch.cat([current_input, next_embedding], dim=1)
         
@@ -302,7 +390,7 @@ class MTSGen(PreTrainedModel):
             logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items()}
             return predictions, logits
         else:
-            return predictions
+            return predictions'''
 
     def _compute_outputs(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """计算各输出头"""
@@ -445,7 +533,7 @@ class MixedTrainingForward:
     def _init_sequence(self, batch_size, device):
         """初始化起始序列"""
         start_input = self.model.start_token.expand(batch_size, 1, -1).to(device)
-        start_input = start_input + self.model.positional_encoding.position_embeddings(
+        start_input = start_input + self.model.positional_encoding(
             torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         )
         return start_input
@@ -504,8 +592,8 @@ class MixedTrainingForward:
         next_embedding = self.model.note_embedding(next_note)
         seq_len = current_input.shape[1]
 
-        next_embedding = next_embedding + self.model.positional_encoding.position_embeddings(
-            torch.full((current_input.shape[0], 1), seq_len, dtype=torch.long, device=device)
+        next_embedding = next_embedding + self.model.positional_encoding(
+            torch.full((current_input.shape[0],1, 1), seq_len, dtype=torch.long, device=device)
         )
 
         return torch.cat([current_input, next_embedding], dim=1)
@@ -525,7 +613,7 @@ def main():
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
+    #model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
