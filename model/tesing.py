@@ -34,7 +34,7 @@ def test_basic_comparison(mid1, mid2):
             'time': elapsed
         }
 
-        print(f"  相似度: {similarity:.4f}")
+        print(f"  相似度: {similarity}")
         print(f"  耗时: {elapsed:.4f}秒")
 
     # 显示总结
@@ -43,7 +43,7 @@ def test_basic_comparison(mid1, mid2):
     print("=" * 60)
 
     for method, result in results.items():
-        print(f"{method:10s} - 相似度: {result['similarity']:.4f}, 耗时: {result['time']:.4f}秒")
+        print(f"{method:10s} - 相似度: {result['similarity']}, 耗时: {result['time']:.4f}秒")
 
     return results
 

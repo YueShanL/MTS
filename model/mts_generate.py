@@ -14,8 +14,11 @@ from transformers import PreTrainedModel, EncodecModel
 from model.dataset import decode
 from model.focal_loss import FocalLoss
 from model.loss import AutoregressiveMultiTaskLoss
+from model.mid_comparsion import midi_to_pretty_midi
 from model.mts_config import MTSGenConfig
 from model.preprocess import TemporalAdapter, NoteEmbedding, PositionalEncoding
+from model.tesing import test_basic_comparison
+from utils.gp2mid import gp5_to_midi_simple
 
 
 # ============ 主模型 ============
@@ -613,13 +616,14 @@ def main():
 
     # 创建模型
     model = MTSGen(config)
-    #model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
+    model.load_state_dict(torch.load(f'best_model_150_epoch16.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     dataset_path = "../output/Model/dataset"
     dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
-    sample = dataset[random.randint(0, len(dataset) - 1)]
+    size = 400
+    sample = dataset[random.randint(0, size)]
 
     # 测试数据
     batch_size = 1
@@ -675,10 +679,10 @@ def main():
     with torch.no_grad():
         generate_outputs, logits = model(
             audio_input=dummy_audio,
-            context_notes=dummy_context,
+            #context_notes=dummy_context,
             teacher_forcing=False,
             generate_length=64,
-            do_sample=True,
+            do_sample=False,
             return_logits=True
         )
 
@@ -694,6 +698,11 @@ def main():
 
     song = decode(sample)
     target = decode(dummy_target)
+
+    mid1 = midi_to_pretty_midi(gp5_to_midi_simple(song, output_midi_path='out.mid'))
+    mid2 = midi_to_pretty_midi(gp5_to_midi_simple(target, output_midi_path='target.mid'))
+
+    test_basic_comparison(mid1, mid2)
 
     gp.write(song, 'out.gp5')
     gp.write(target, 'target.gp5')

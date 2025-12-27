@@ -1,15 +1,15 @@
 import guitarpro
-from guitarpro import Duration
+from guitarpro import Duration, Song
 from mido import Message, MidiFile, MidiTrack, MetaMessage
 
 
-def gp5_to_midi_simple(gp5_file_path, output_midi_path='output.mid',
+def gp5_to_midi_simple(gp5_file, output_midi_path='output.mid',
                        track_index=0, program=25, ticks_per_beat=480, tempo=120):
     """
     简化版GP5到MIDI转换函数，修复同一时刻音符拆分问题
 
     Args:
-        gp5_file_path: GP5文件路径
+        gp5_file: GP5文件路径
         output_midi_path: 输出MIDI文件路径
         track_index: 要转换的音轨索引
         program: MIDI音色程序号
@@ -18,9 +18,14 @@ def gp5_to_midi_simple(gp5_file_path, output_midi_path='output.mid',
     """
     try:
         # 1. 解析GP5文件
-        song = guitarpro.parse(gp5_file_path)
+        if isinstance(gp5_file, str):
+            song = guitarpro.parse(gp5_file)
+        elif isinstance(gp5_file, Song):
+            song = gp5_file
+        else:
+            raise TypeError("gp5_file must be str or Song")
 
-        # 2. 创建MIDI文件
+            # 2. 创建MIDI文件
         midi_file = MidiFile(ticks_per_beat=ticks_per_beat)
         midi_track = MidiTrack()
         midi_file.tracks.append(midi_track)
@@ -306,8 +311,8 @@ def collect_notes_with_tie_processing(gp_track, ticks_per_beat):
 # 使用示例
 if __name__ == "__main__":
     # 转换单个音轨
-    midi_file = gp5_to_midi_simple('out.gp5', '../model/out.mid', track_index=0)
-    gp5_to_midi_simple('target.gp5', '../model/target.mid', track_index=0)
+    midi_file = gp5_to_midi_simple('../model/out.gp5', '../model/out.mid', track_index=0)
+    gp5_to_midi_simple('../model/target.gp5', '../model/target.mid', track_index=0)
     if midi_file:
         print(f"MIDI文件信息:")
         print(f"  音轨数: {len(midi_file.tracks)}")

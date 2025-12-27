@@ -4,24 +4,17 @@ MIDI相似度比较工具包
 """
 
 import os
-import time
+import warnings
+
 import numpy as np
 import pretty_midi
-from scipy.spatial.distance import cosine, euclidean
-from scipy.stats import pearsonr, wasserstein_distance
-from sklearn.preprocessing import minmax_scale
-from sklearn.metrics.pairwise import cosine_similarity
-import warnings
+from pretty_midi import PrettyMIDI
+from scipy.spatial.distance import cosine
+from scipy.stats import pearsonr
 
 warnings.filterwarnings('ignore')
 
-try:
-    from fastdtw import fastdtw
-
-    HAS_FASTDTW = True
-except ImportError:
-    HAS_FASTDTW = False
-    print("注意: fastdtw未安装，DTW功能将不可用")
+from dtaidistance import dtw
 
 
 class MIDISimilarityToolkit:
@@ -108,8 +101,14 @@ class MIDISimilarityToolkit:
 
         # 加载MIDI文件
         try:
-            midi1 = pretty_midi.PrettyMIDI(midi_path1)
-            midi2 = pretty_midi.PrettyMIDI(midi_path2)
+            if isinstance(midi_path1, str):
+                midi1 = pretty_midi.PrettyMIDI(midi_path1)
+            elif isinstance(midi_path1, PrettyMIDI):
+                midi1 = midi_path1
+            if isinstance(midi_path2, str):
+                midi2 = pretty_midi.PrettyMIDI(midi_path2)
+            elif isinstance(midi_path2, PrettyMIDI):
+                midi2 = midi_path2
         except Exception as e:
             print(f"加载MIDI文件失败: {e}")
             return 0.0
@@ -270,10 +269,6 @@ class MIDISimilarityToolkit:
         return self._quick_compare(feat1, feat2)
 
     def _compare_melodic(self, midi1, midi2):
-        """旋律轮廓比较"""
-        if not HAS_FASTDTW:
-            print("警告: fastdtw未安装，使用替代方法")
-            return self._compare_balanced(midi1, midi2)
 
         # 使用DTW比较旋律轮廓
         contour1 = self._extract_melody_contour(midi1)
@@ -283,7 +278,12 @@ class MIDISimilarityToolkit:
             return 0.5
 
         # 计算DTW距离
-        distance, _ = fastdtw(contour1.flatten(), contour2.flatten(), dist=euclidean)
+        if contour1.ndim == 1:
+            contour1 = contour1.reshape(-1, 1)
+        if contour2.ndim == 1:
+            contour2 = contour2.reshape(-1, 1)
+
+        distance = dtw.distance(contour1, contour2)
 
         # 归一化距离到相似度
         max_range1 = max(contour1) - min(contour1) if len(contour1) > 0 else 1
@@ -1062,6 +1062,34 @@ class MIDISimilarityToolkit:
 
 
 # ================== 简单使用示例 ==================
+def midi_to_pretty_midi(mido_midi):
+    """
+    将mido MIDI对象转换为pretty_midi对象
+
+    Args:
+        mido_midi: mido.MidiFile对象
+
+    Returns:
+        pretty_midi.PrettyMIDI对象
+    """
+    # 方法1: 通过临时文件（简单但效率较低）
+    # import tempfile
+    # with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as tmp:
+    #     mido_midi.save(tmp.name)
+    #     pm = pretty_midi.PrettyMIDI(tmp.name)
+    # return pm
+
+    # 方法2: 通过字节流（更高效）
+    # 创建一个字节流来保存MIDI数据
+    import io
+    midi_bytes = io.BytesIO()
+    mido_midi.save(file=midi_bytes)
+    midi_bytes.seek(0)  # 回到起始位置
+
+    # 使用pretty_midi从字节流加载
+    pm = pretty_midi.PrettyMIDI(midi_bytes)
+
+    return pm
 
 def create_sample_midi():
     """创建示例MIDI文件用于测试"""
