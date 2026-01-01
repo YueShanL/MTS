@@ -1062,7 +1062,7 @@ class MIDISimilarityToolkit:
 
 
 # ================== 简单使用示例 ==================
-def midi_to_pretty_midi(mido_midi):
+def midi_to_pretty_midi(mido_midi, byte=False):
     """
     将mido MIDI对象转换为pretty_midi对象
 
@@ -1088,7 +1088,8 @@ def midi_to_pretty_midi(mido_midi):
 
     # 使用pretty_midi从字节流加载
     pm = pretty_midi.PrettyMIDI(midi_bytes)
-
+    if byte:
+        return pm, midi_bytes
     return pm
 
 def create_sample_midi():

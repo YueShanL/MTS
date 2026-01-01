@@ -1,3 +1,4 @@
+import os
 import random
 from typing import Dict, Optional, Tuple, Union
 
@@ -7,18 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import Dataset
 from torch import Tensor
-from torch.utils.data import DataLoader
-from tqdm import tqdm
 from transformers import PreTrainedModel, EncodecModel
 
 from model.dataset import decode
-from model.focal_loss import FocalLoss
-from model.loss import AutoregressiveMultiTaskLoss
-from model.mid_comparsion import midi_to_pretty_midi
 from model.mts_config import MTSGenConfig
 from model.preprocess import TemporalAdapter, NoteEmbedding, PositionalEncoding
-from model.tesing import test_basic_comparison
-from utils.gp2mid import gp5_to_midi_simple
+from model.rl.simulator import GuitarSequenceAnalyzer, PresetConfigs
 
 
 # ============ 主模型 ============
@@ -181,17 +176,17 @@ class MTSGen(PreTrainedModel):
     ) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]:
         """
         前向传播，支持返回logits
-        
+
         Args:
             return_logits: 是否返回logits（仅在非Teacher Forcing时有效）
-        
+
         Returns:
             如果teacher_forcing=True或return_logits=False: 返回预测字典
             如果teacher_forcing=False且return_logits=True: 返回元组 (predictions, logits)
         """
         # 编码音频
         audio_features = self.encode_audio(audio_input)
-        
+
         # 编码上下文音符（如果有）
         if context_notes is not None:
             context_embeddings = self.note_embedding(context_notes)
@@ -199,7 +194,7 @@ class MTSGen(PreTrainedModel):
             memory = self.fusion_encoder(combined_features)
         else:
             memory = self.fusion_encoder(audio_features)
-        
+
         # 根据训练模式选择
         if target_notes is not None and teacher_forcing:
             # Teacher Forcing模式：直接返回logits（原本就是logits格式）
@@ -207,21 +202,21 @@ class MTSGen(PreTrainedModel):
         else:
             # 自回归生成模式
             generate_length = generate_length or self.config.notes_per_bar * self.config.predict_bars
-            
+
             return self._autoregressive_generate(
                 memory, generate_length, do_sample=do_sample, return_logits=return_logits
             )
 
 
     def _teacher_force_forward(
-        self, 
-        memory: torch.Tensor, 
+        self,
+        memory: torch.Tensor,
         target_notes: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
         """Teacher Forcing前向传播，返回logits"""
         batch_size = target_notes['duration'].shape[0]
         target_len = target_notes['duration'].shape[1]
-        
+
         # 准备右移的目标序列
         shifted_notes = {}
         for key in ['duration', 'fret', 'technique']:
@@ -229,24 +224,24 @@ class MTSGen(PreTrainedModel):
                 shifted = torch.full_like(target_notes[key], -100)
                 shifted[:, 1:] = target_notes[key][:, :-1]
                 shifted_notes[key] = shifted
-        
+
         # 嵌入目标序列
         target_embeddings = self.note_embedding(shifted_notes)
         target_embeddings = self.positional_encoding(target_embeddings)
-        
+
         # 添加起始标记
         start_tokens = self.start_token.expand(batch_size, -1, -1)
         target_embeddings = torch.cat([start_tokens, target_embeddings], dim=1)
-        
+
         # 自回归解码
         seq_len = target_embeddings.shape[1]
         tgt_mask = self._generate_square_subsequent_mask(seq_len).to(target_embeddings.device)
         decoder_output = self.autoregressive_decoder(target_embeddings, memory, tgt_mask)
-        
+
         # 去掉起始标记的输出
         decoder_output = decoder_output[:, 1:, :]
         decoder_output = self.output_norm(decoder_output)
-        
+
         # 计算输出（logits）
         return self._compute_outputs(decoder_output)  # 返回logits
 
@@ -612,11 +607,11 @@ class MixedTrainingForward:
 # ============ 测试代码 ============
 def main():
     """测试主函数"""
-    config = MTSGenConfig.mtsGen_150m()
+    config = MTSGenConfig.mtsGen_300m_depth()
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'best_model_150_epoch16.pth'))
+    model.load_state_dict(torch.load(f'best_model_300m_epoch33.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -631,7 +626,7 @@ def main():
     context_length = 64
 
     # 模拟音频输入
-    dummy_audio = torch.randn(batch_size,1, audio_length)
+    #dummy_audio = torch.randn(batch_size,1, audio_length)
     dummy_audio = sample['audio_input'][:audio_length].unsqueeze(0).unsqueeze(1)
     import soundfile as sf
 
@@ -675,14 +670,15 @@ def main():
 
     # 测试生成模式
     print("\n测试生成模式:")
-    model.eval()
+    generate_sample(model, sample, ".")
+    '''model.eval()
     with torch.no_grad():
         generate_outputs, logits = model(
             audio_input=dummy_audio,
             #context_notes=dummy_context,
             teacher_forcing=False,
             generate_length=64,
-            do_sample=False,
+            do_sample=True,
             return_logits=True
         )
 
@@ -702,16 +698,96 @@ def main():
     mid1 = midi_to_pretty_midi(gp5_to_midi_simple(song, output_midi_path='out.mid'))
     mid2 = midi_to_pretty_midi(gp5_to_midi_simple(target, output_midi_path='target.mid'))
 
-    test_basic_comparison(mid1, mid2)
+    comparator = MidiVersionComparator(
+        time_resolution=0.1,
+        feature_type='both',  # 对和声变化敏感
+        normalize_features=True
+    )
+    result = comparator.compare(mid1, mid2, use_dtw=True)
+
+    # 4. 打印结果摘要
+    print(f"\n{'=' * 50}")
+    print("比较结果摘要:")
+    print(f"{'=' * 50}")
+    print(f"平均余弦相似度: {result['avg_cosine_similarity']:.3f}")
+    print(f"相似度标准差: {result['similarity_std']:.3f}")
+    print(f"DTW归一化距离: {result['normalized_distance']:.3f}")
+    print(f"时长比例: {result['duration_ratio']:.2f}")
+    print(f"版本1音符数: {result['info1']['note_count']}")
+    print(f"版本2音符数: {result['info2']['note_count']}")
+    print(f"版本1音高范围: {result['info1']['pitch_range']}")
+    print(f"版本2音高范围: {result['info2']['pitch_range']}")
+
+    print('out hardness')
+    print('='*60)
+    analysis(sample['fret'].tolist())
+    print('='*60)
+    print('target hardness')
+    analysis(dummy_target['fret'].tolist())
 
     gp.write(song, 'out.gp5')
     gp.write(target, 'target.gp5')
 
-    print(song)
+    print(song)'''
 
 
+def generate_sample(model, data, output_path):
+    batch_size = 1
+    audio_length = 24000 * 8
+    context_length = 64
+
+    if not os.path.isdir(output_path):
+        os.makedirs(output_path)
+
+    audio = data['audio_input'][:audio_length]
+    if isinstance(audio, list):
+        audio = Tensor(audio)
+    audio = audio.unsqueeze(0).unsqueeze(1)
+    context = data['context_notes']
+    for key, value in context.items():
+        context[key] = value.unsqueeze(0)
+    target = data['target_notes']
+
+    model.eval()
+    with torch.no_grad():
+        generate_outputs, logits = model(
+            audio_input=audio,
+            context_notes=context,
+            teacher_forcing=False,
+            generate_length=64,
+            do_sample=False,
+            return_logits=True
+        )
+
+    sample = {}
+    for key, value in generate_outputs.items():
+        if value is not None:
+            sample[key] = value[0]
+
+    song = decode(sample)
+    target = decode(target)
+
+    gp.write(song, f'{output_path}/out.gp5')
+
+    gp.write(target, f'{output_path}/target.gp5')
 
 
+def analysis(fret):
+    analyzer = GuitarSequenceAnalyzer(PresetConfigs.get_easy())
 
+    report = analyzer.analyze_sequence(fret)
+
+    stats = report["statistics"]
+    print(f"总体难度: {stats['overall_difficulty']:.1f}")
+    print(f"难度等级: {stats['difficulty_level']}")
+    print(f"平均位置难度: {stats['avg_position_difficulty']:.1f}")
+    print(f"平均移动难度: {stats['avg_move_difficulty']:.1f}")
+    print(f"多音符位置数: {report['multi_note_analysis']['total_multi_notes']}")
+
+    # 显示移动因子统计
+    if report["hardest_moves"]:
+        hardest = report["hardest_moves"][0]
+        print(f"最难移动: {hardest['from'] + 1}→{hardest['to'] + 1} "
+              f"(难度: {hardest['difficulty']:.1f}, 因子: {hardest['move_factor']:.1f})")
 if __name__ == "__main__":
     main()
