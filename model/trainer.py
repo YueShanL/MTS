@@ -14,6 +14,7 @@ from model.loss import LossWrapper, AutoregressiveMultiTaskLoss
 from model.mts_config import MTSGenConfig
 from model.mts_generate import MTSGen, MixedTrainingForward
 
+import guitarpro as gp
 
 class TrainingConfig:
     """训练配置"""
@@ -386,7 +387,14 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
             # 保存最佳模型
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), f'{output_path}/best_model_epoch{epoch}.pth')
+                file_dir = f'{output_path}/best_model_epoch{epoch}'
+                if not os.path.isdir(file_dir):
+                    os.makedirs(file_dir)
+                torch.save(model.state_dict(), f'{file_dir}/best_model_epoch{epoch}.pth')
+                if all_batch_losses:
+                    _generate_loss_plot(all_batch_losses, f'{file_dir}')
+                _generate_sample(model, train_dataset[random.randint(0, len(train_dataset) - 1)], f'{file_dir}/train')
+                _generate_sample(model, val_dataset[random.randint(0, len(val_dataset) - 1)], f'{file_dir}/eval')
 
         # 记录日志
         log_entry = {
@@ -407,8 +415,10 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
               f'TF Prob: {tf_prob:.2f}, '
               f'TF/AR: {trainer.stats["tf_used"]}/{trainer.stats["ar_used"]}')
 
-    if all_batch_losses:
-        _generate_loss_plot(all_batch_losses, output_path)
+        if all_batch_losses:
+            _generate_loss_plot(all_batch_losses, output_path)
+
+        torch.save(model.state_dict(), f'{output_path}/final_model.pth')
 
     return training_log
 
@@ -442,6 +452,46 @@ def evaluate_model(model, loss_fn, dataloader):
 
     model.train()
     return total_loss / len(dataloader)
+
+def _generate_sample(model, data, output_path):
+    batch_size = 1
+    audio_length = 24000 * 8
+    context_length = 64
+
+    if not os.path.isdir(output_path):
+        os.makedirs(output_path)
+
+    audio = data['audio_input'][:audio_length]
+    if isinstance(audio, list):
+        audio = Tensor(audio)
+    audio = audio.unsqueeze(0).unsqueeze(1)
+    context = sample['context_notes']
+    for key, value in context.items():
+        context[key] = value.unsqueeze(0)
+    target = sample['target_notes']
+    
+    model.eval()
+    with torch.no_grad():
+        generate_outputs, logits = model(
+            audio_input=audio,
+            context_notes=context,
+            teacher_forcing=False,
+            generate_length=64,
+            do_sample=False,
+            return_logits=True
+        )
+
+    sample = {}
+    for key, value in generate_outputs.items():
+        if value is not None:
+            sample[key] = value[0]
+
+    song = decode(sample)
+    target = decode(dummy_target)
+
+    gp.write(song, f'{output_path}/out.gp5')
+    
+    gp.write(target, f'{output_path}/target.gp5')
 
 
 def _generate_loss_plot(all_losses, output_path):

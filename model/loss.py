@@ -62,7 +62,7 @@ class AutoregressiveMultiTaskLoss(nn.Module):
 
         # 设置具体权重（根据频率反比调整）
         dur_weights = {
-            0: 0.05,   # 休止符：48.7% -> 权重0.05 (强烈惩罚)
+            0: 0.2,   # 休止符：48.7% -> 权重0.05 (强烈惩罚)
             1: 3.5,    # 非常罕见但重要的时值：1.1% -> 权重3.5 (高奖励)
             2: 3.0,    # 1.3% -> 权重3.0
             3: 2.0,    # 2.5% -> 权重2.0
@@ -85,7 +85,7 @@ class AutoregressiveMultiTaskLoss(nn.Module):
         self.fret_alpha = torch.ones(self.config.max_fret + 2).to(self.device)
 
         # 不演奏标记(fret 25)极度惩罚
-        self.fret_alpha[-1] = 0.08  # 77.4% -> 权重0.08
+        self.fret_alpha[-1] = 0.2  # 77.4% -> 权重0.08
 
         # 真实品位权重策略：
         # 1. 常用低把位(0-12)：中等奖励（频率相对较高）

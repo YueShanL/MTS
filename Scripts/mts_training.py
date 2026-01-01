@@ -11,7 +11,7 @@ from model.mts_config import MTSGenConfig
 from model.mts_generate import MTSGen
 from model.trainer import train_mixed_model
 
-linux = 0
+linux = 1
 debug = 0
 if __name__ == '__main__':
     dataset_path = "output/Model/dataset" if linux else "../output/Model/dataset"
@@ -108,13 +108,13 @@ if __name__ == '__main__':
 
 
     train_val_split = dataset.train_test_split(
-    test_size=0.2,  # 评估集比例
-    seed=42,        # 随机种子
-    shuffle=True    # 是否打乱
+    test_size=0.2,  
+    seed=42,        
+    shuffle=True   
     )
-    config = MTSGenConfig.mtsGen_150m()
+    config = MTSGenConfig.mtsGen_300m_depth()
     model = MTSGen(config)
     # model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
     model.to('cuda')
     train_mixed_model(model, train_val_split['train'], val_dataset=train_val_split['test'],
-                          num_epochs=10, batch_size=4, output_path=output_path)
+                          num_epochs=100, batch_size=8, output_path=output_path)
