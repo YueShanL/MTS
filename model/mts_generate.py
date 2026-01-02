@@ -670,8 +670,7 @@ def main():
 
     # 测试生成模式
     print("\n测试生成模式:")
-    generate_sample(model, sample, ".")
-    '''model.eval()
+    model.eval()
     with torch.no_grad():
         generate_outputs, logits = model(
             audio_input=dummy_audio,
@@ -728,7 +727,7 @@ def main():
     gp.write(song, 'out.gp5')
     gp.write(target, 'target.gp5')
 
-    print(song)'''
+    print(song)
 
 
 def generate_sample(model, data, output_path):

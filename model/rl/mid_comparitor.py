@@ -339,6 +339,35 @@ class MidiVersionComparator:
 
         return result
 
+def midi_to_pretty_midi(mido_midi, byte=False):
+    """
+    将mido MIDI对象转换为pretty_midi对象
+
+    Args:
+        mido_midi: mido.MidiFile对象
+
+    Returns:
+        pretty_midi.PrettyMIDI对象
+    """
+    # 方法1: 通过临时文件（简单但效率较低）
+    # import tempfile
+    # with tempfile.NamedTemporaryFile(suffix='.mid', delete=False) as tmp:
+    #     mido_midi.save(tmp.name)
+    #     pm = pretty_midi.PrettyMIDI(tmp.name)
+    # return pm
+
+    # 方法2: 通过字节流（更高效）
+    # 创建一个字节流来保存MIDI数据
+    import io
+    midi_bytes = io.BytesIO()
+    mido_midi.save(file=midi_bytes)
+    midi_bytes.seek(0)  # 回到起始位置
+
+    # 使用pretty_midi从字节流加载
+    pm = pretty_midi.PrettyMIDI(midi_bytes)
+    if byte:
+        return pm, midi_bytes
+    return pm
 
 # 使用示例
 if __name__ == "__main__":
