@@ -100,21 +100,22 @@ if __name__ == '__main__':
                 # 清理临时目录
                 shutil.rmtree(temp_dir)
 
-    max_sample_size = 5000
+    max_sample_size = 110000
         # 加载最终数据集
-    dataset = Dataset.load_from_disk(dataset_path)
+    dataset = Dataset.load_from_disk(dataset_path).with_format("torch")
     dataset = dataset.select(range(min(max_sample_size, len(dataset))))
     #Dataset.from_generator(dataset.stream_generator).save_to_disk(dataset_path=dataset_path)
 
 
+
     train_val_split = dataset.train_test_split(
-    test_size=0.2,  
-    seed=42,        
-    shuffle=True   
+    test_size=0.1,
+    seed=42,
+    shuffle=True
     )
     config = MTSGenConfig.mtsGen_300m_depth()
     model = MTSGen(config)
-    # model.load_state_dict(torch.load(f'best_model_epoch4.pth'))
+    model.load_state_dict(torch.load(f'Scripts/final_model.pth'))
     model.to('cuda')
     train_mixed_model(model, train_val_split['train'], val_dataset=train_val_split['test'],
                           num_epochs=100, batch_size=8, output_path=output_path)
