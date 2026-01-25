@@ -434,6 +434,12 @@ class GuitarSequenceAnalyzer:
 
         return parsed
 
+    def evaluate(self, sequence_data) -> float:
+        report = self.analyze_sequence(sequence_data)
+
+        stats = report["statistics"]
+        return stats['overall_difficulty']
+
     def analyze_sequence(self, sequence_data) -> Dict[str, Any]:
         """分析整个序列"""
         # 重置状态

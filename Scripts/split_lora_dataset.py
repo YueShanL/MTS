@@ -21,13 +21,13 @@ progress_bar = tqdm(data, desc=f'loading')
 n = 0
 def generator():
     for i in data:
-        i['labels'].squeeze(0)
+        i['labels'].squeeze()
         yield i
 for i in progress_bar:
     if n >= 1000:
         break
     n += 1 
-    i['labels'].squeeze(0)
+    i['labels'] = i['labels'].squeeze()
     new_data.append(i)
 dataset = Dataset.from_list(new_data)
 dataset = dataset.remove_columns('sample_rate').rename_columns(

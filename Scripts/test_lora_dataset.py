@@ -1,6 +1,6 @@
 import random
 
-from datasets import Features, Value, Sequence, Dataset
+from datasets import Features, Value, Sequence, DatasetDict
 import soundfile as sf
 
 debug = 0
@@ -21,4 +21,4 @@ if __name__ == '__main__':
 
     dataset = DatasetDict.load_from_disk(dataset_path)['train']
 
-    sf.write(f"{output_path}out.wav",  dataset[random.randint(0, len(dataset) - 1)]['target_audio_values'], 32000)
+    sf.write(f"{output_path}out.wav",  dataset[random.randint(0, len(dataset) - 1)]['target_audio_values'].squezze(), 32000)

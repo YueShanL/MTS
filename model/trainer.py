@@ -10,6 +10,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from model.dataset import decode
 from model.loss import LossWrapper, AutoregressiveMultiTaskLoss
 from model.mts_config import MTSGenConfig
 from model.mts_generate import MTSGen, MixedTrainingForward
@@ -126,7 +127,7 @@ class MixedTrainer:
 
         for batch_idx, batch in enumerate(progress_bar):
             batch = self._move_to_device(batch)
-            loss, details = self.train_step(batch, teacher_forcing_prob)
+            loss, details = self.train_step(batch, 0)
             total_loss += loss
 
             # 收集loss信息
@@ -134,7 +135,7 @@ class MixedTrainer:
                 'epoch': epoch + 1,
                 'batch': batch_idx + 1,
                 'total_loss': loss,
-                'teacher_forcing_prob': teacher_forcing_prob,
+                'teacher_forcing_prob': 0,
             }
 
             loss_records.append(record)
@@ -396,6 +397,18 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
                 _generate_sample(model, train_dataset[random.randint(0, len(train_dataset) - 1)], f'{file_dir}/train')
                 _generate_sample(model, val_dataset[random.randint(0, len(val_dataset) - 1)], f'{file_dir}/eval')
 
+        if (epoch + 1) % 10 == 0:
+                best_val_loss = val_loss
+                file_dir = f'{output_path}/checkpoint_epoch{epoch}'
+                if not os.path.isdir(file_dir):
+                    os.makedirs(file_dir)
+                torch.save(model.state_dict(), f'{file_dir}/checkpoint_epoch{epoch}.pth')
+                if all_batch_losses:
+                    _generate_loss_plot(all_batch_losses, f'{file_dir}')
+                _generate_sample(model, train_dataset[random.randint(0, len(train_dataset) - 1)], f'{file_dir}/train')
+                _generate_sample(model, val_dataset[random.randint(0, len(val_dataset) - 1)], f'{file_dir}/eval')
+
+
         # 记录日志
         log_entry = {
             'epoch': epoch,
@@ -461,14 +474,20 @@ def _generate_sample(model, data, output_path):
     if not os.path.isdir(output_path):
         os.makedirs(output_path)
 
+    device = next(model.parameters()).device
+
     audio = data['audio_input'][:audio_length]
     if isinstance(audio, list):
         audio = Tensor(audio)
-    audio = audio.unsqueeze(0).unsqueeze(1)
-    context = sample['context_notes']
+    audio = audio.unsqueeze(0).unsqueeze(1).to(device)
+    context = data['context_notes']
     for key, value in context.items():
-        context[key] = value.unsqueeze(0)
-    target = sample['target_notes']
+        
+        if isinstance(value, list):
+            context[key] = Tensor(value).unsqueeze(0).to(device)
+        else:
+            context[key] = value.unsqueeze(0).to(device)
+    target = data['target_notes']
     
     model.eval()
     with torch.no_grad():
@@ -487,7 +506,7 @@ def _generate_sample(model, data, output_path):
             sample[key] = value[0]
 
     song = decode(sample)
-    target = decode(dummy_target)
+    target = decode(target)
 
     gp.write(song, f'{output_path}/out.gp5')
     

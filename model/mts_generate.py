@@ -105,7 +105,6 @@ class MTSGen(PreTrainedModel):
         print(f"模型初始化完成")
 
     def _init_weights(self, module):
-        """改进的权重初始化"""
         if isinstance(module, nn.Linear):
             # 使用Xavier初始化或Kaiming初始化
             if module.weight.shape[0] > 1000:  # 大层
@@ -120,31 +119,16 @@ class MTSGen(PreTrainedModel):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Parameter):
-            # 起始标记的更好初始化
             if module is self.start_token:
-                nn.init.normal_(module.data, mean=0.0, std=0.01)  # 更小的标准差
+                nn.init.normal_(module.data, mean=0.0, std=0.01)
             else:
                 nn.init.normal_(module.data, mean=0.0, std=0.02)
-
-    '''def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-        elif isinstance(module, nn.Parameter):
-            module.data.normal_(mean=0.0, std=0.02)'''
 
     def encode_audio(self, audio_input: torch.Tensor) -> torch.Tensor:
         if audio_input.max() > 0:
             audio_input = nn.functional.normalize(audio_input)
-        """编码音频特征 - 适配EnCodec"""
+        """EnCodec"""
         with torch.set_grad_enabled(not self.config.freeze_encoder):
-            # ============ 方案一：使用编码器的连续特征（推荐） ============
             with torch.no_grad() if self.config.freeze_encoder else torch.enable_grad():
                 # 直接调用编码器获取连续特征，而非使用encode()
                 # audio_input形状应为 [B, 1, T]
