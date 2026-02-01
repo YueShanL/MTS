@@ -1,9 +1,14 @@
-import librosa
-import pretty_midi
-import numpy as np
-import torch
+import logging
 import os
 from pathlib import Path
+
+import librosa
+import numpy as np
+import pretty_midi
+import torch
+
+from utils.redirector import SuppressOutput
+
 
 def midi_to_audio_tensor(midi_path, soundfont_path = None, sr=44100, duration=None, return_numpy=False,
                         debug=False, debug_dir="debug_output", save_audio=False,
@@ -26,6 +31,11 @@ def midi_to_audio_tensor(midi_path, soundfont_path = None, sr=44100, duration=No
         audio_tensor (torch.Tensor或numpy.ndarray): 形状为 (samples,) 的音频张量
         sr (int): 采样率
     """
+    # 禁用所有警告
+    logging.getLogger('pretty_midi').setLevel(logging.CRITICAL)
+
+    # 或者禁用所有日志
+    logging.getLogger().setLevel(logging.CRITICAL)
 
     if soundfont_path is None:
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -36,13 +46,15 @@ def midi_to_audio_tensor(midi_path, soundfont_path = None, sr=44100, duration=No
         # 创建调试输出目录
         if debug and not os.path.exists(debug_dir):
             os.makedirs(debug_dir)
-
-        # 加载MIDI文件
-        midi_data = pretty_midi.PrettyMIDI(midi_path)
+        if isinstance(midi_path, str):
+            # 加载MIDI文件
+            midi_data = pretty_midi.PrettyMIDI(midi_path)
+        elif isinstance(midi_path, pretty_midi.PrettyMIDI):
+            midi_data = midi_path
 
         # 调试信息：打印MIDI文件基本信息
         if debug:
-            print(f"MIDI文件信息: {midi_path}")
+            if isinstance(midi_path, str): print(f"MIDI文件信息: {midi_path}")
             print(f"  持续时间: {midi_data.get_end_time():.2f} 秒")
             print(f"  乐器数量: {len(midi_data.instruments)}")
             for i, instrument in enumerate(midi_data.instruments):
@@ -61,11 +73,9 @@ def midi_to_audio_tensor(midi_path, soundfont_path = None, sr=44100, duration=No
             print(f"使用SoundFont合成音频: {soundfont_path}")
 
         # 使用fluidsynth合成音频
-        import fluidsynth
-        sf = fluidsynth.Synth()
-        sf.start()
 
         # 合成音频
+        import fluidsynth
         audio_signal = midi_data.fluidsynth(fs=sr, sf2_path=soundfont_path)
 
 

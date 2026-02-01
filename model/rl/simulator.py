@@ -5,6 +5,10 @@ from enum import Enum
 from dataclasses import dataclass
 import json
 
+from torch.functional import Tensor
+
+from utils.GP5Generator import GuitarTechnique
+
 
 # ====================== 配置类 ======================
 
@@ -200,10 +204,41 @@ class PositionAnalyzer:
         self.config = config
         self.hand_model = hand_model
 
-    def analyze_position(self, frets: List[int]) -> Dict[str, Any]:
-        """分析单个位置"""
-        # 提取有效音符
-        active_frets = [(i, f) for i, f in enumerate(frets) if 0 <= f < self.config.non_playing_fret]
+        # 技巧难度系数
+        self.technique_difficulty_factors = {
+            GuitarTechnique.NORMAL: 1.0,
+            GuitarTechnique.HAMMER_ON: 1.2,
+            GuitarTechnique.PULL_OFF: 1.2,
+            GuitarTechnique.SLIDE: 1.3,
+            GuitarTechnique.BEND: 1.5,
+            GuitarTechnique.VIBRATO: 1.4,
+            GuitarTechnique.MUTE: 0.8,
+            GuitarTechnique.NATURAL_HARMONIC: 1.3,
+            GuitarTechnique.ARTIFICIAL_HARMONIC: 1.6,
+            GuitarTechnique.TAPPED_HARMONIC: 1.7,
+            GuitarTechnique.PINCH_HARMONIC: 1.8,
+            GuitarTechnique.SEMI_HARMONIC: 1.4,
+            GuitarTechnique.TREMOLO: 1.5,
+            GuitarTechnique.PALM_MUTE: 0.9,
+        }
+
+    def analyze_position(self, frets: List[int], techniques: List[GuitarTechnique] = None) -> Dict[str, Any]:
+        """分析单个位置，包含技巧信息"""
+        # 如果未提供技巧，使用默认的NORMAL技巧
+        if techniques is None:
+            techniques = [GuitarTechnique.NORMAL] * 6
+        elif len(techniques) != 6:
+            raise ValueError(f"techniques长度应为6，实际为{len(techniques)}")
+
+        # 提取有效音符（包括技巧信息）
+        active_frets = []
+        active_techniques = []
+
+        for i, (fret, tech) in enumerate(zip(frets, techniques)):
+            if 0 <= fret < self.config.non_playing_fret:
+                active_frets.append((i, fret))
+                active_techniques.append(tech)
+
         active_strings = [s for s, _ in active_frets]
         active_fret_values = [f for _, f in active_frets]
         note_count = len(active_frets)
@@ -211,9 +246,11 @@ class PositionAnalyzer:
         # 基础信息
         position_info = {
             "frets": frets,
+            "techniques": techniques,  # 存储原始技巧列表
             "active_frets": active_frets,
             "active_fret_values": active_fret_values,
             "active_strings": active_strings,
+            "active_techniques": active_techniques,  # 存储激活音符的技巧
             "note_count": note_count,
             "is_single_note": note_count == 1,
             "is_multi_note": note_count >= self.config.multi_note_threshold
@@ -225,6 +262,7 @@ class PositionAnalyzer:
                 "fret_difficulty": 0.0,
                 "stretch_difficulty": 0.0,
                 "note_count_difficulty": 0.0,
+                "technique_difficulty": 0.0,  # 新增技巧难度
                 "total_difficulty": 0.0
             })
             return position_info
@@ -245,12 +283,16 @@ class PositionAnalyzer:
         # 音符数量难度
         note_count_difficulty = self.hand_model.calculate_note_count_difficulty(note_count)
 
-        # 总位置难度
+        # 技巧难度（新增）
+        technique_difficulty = self._calculate_technique_difficulty(active_techniques, active_fret_values)
+
+        # 总位置难度（包含技巧难度）
         total_difficulty = (
                 base_difficulty +
                 fret_difficulty +
                 stretch_difficulty +
-                note_count_difficulty
+                note_count_difficulty +
+                technique_difficulty
         )
 
         position_info.update({
@@ -258,10 +300,56 @@ class PositionAnalyzer:
             "fret_difficulty": fret_difficulty,
             "stretch_difficulty": stretch_difficulty,
             "note_count_difficulty": note_count_difficulty,
-            "total_difficulty": total_difficulty
+            "technique_difficulty": technique_difficulty,  # 新增
+            "total_difficulty": total_difficulty,
+            "technique_breakdown": self._get_technique_breakdown(active_techniques)  # 技巧分类统计
         })
 
         return position_info
+
+    def _calculate_technique_difficulty(self, techniques: List[GuitarTechnique], frets: List[int]) -> float:
+        """计算技巧难度"""
+        if not techniques:
+            return 0.0
+
+        total_difficulty = 0.0
+
+        for tech, fret in zip(techniques, frets):
+            # 基础技巧难度系数
+            base_factor = self.technique_difficulty_factors.get(tech, 1.0)
+
+            # 考虑品位对技巧难度的影响（高品位上某些技巧更难）
+            fret_factor = 1.0
+            if fret > 12:
+                # 高品位技巧难度增加
+                if tech in [GuitarTechnique.BEND, GuitarTechnique.VIBRATO]:
+                    fret_factor = 1.0 + (fret - 12) * 0.02
+                elif tech in [GuitarTechnique.HAMMER_ON, GuitarTechnique.PULL_OFF]:
+                    fret_factor = 1.0 + (fret - 12) * 0.01
+
+            # 技巧难度累加
+            total_difficulty += base_factor * fret_factor
+
+        # 多技巧组合的额外难度（如果一个位置有多种复杂技巧）
+        complex_tech_count = sum(1 for tech in techniques
+                                if tech not in [GuitarTechnique.NORMAL, GuitarTechnique.MUTE, GuitarTechnique.PALM_MUTE])
+
+        if complex_tech_count > 1:
+            # 多种复杂技巧的组合会增加额外难度
+            combination_factor = 1.0 + (complex_tech_count - 1) * 0.1
+            total_difficulty *= combination_factor
+
+        return total_difficulty
+
+    def _get_technique_breakdown(self, techniques: List[GuitarTechnique]) -> Dict[str, int]:
+        """获取技巧分类统计"""
+        breakdown = {}
+
+        for tech in techniques:
+            tech_name = tech.name
+            breakdown[tech_name] = breakdown.get(tech_name, 0) + 1
+
+        return breakdown
 
 
 # ====================== 移动分析 ======================
@@ -408,12 +496,63 @@ class GuitarSequenceAnalyzer:
         self.accumulated_difficulty = 0.0
 
     def parse_sequence(self, sequence_data) -> List[Dict]:
-        """解析序列数据"""
+        """解析序列数据 - 支持新的字典格式和旧格式"""
         parsed = []
 
-        for i, chord_data in enumerate(sequence_data):
-            if isinstance(chord_data, (list, tuple)) and len(chord_data) == 6:
-                frets = list(chord_data)
+        # 判断输入格式
+        if isinstance(sequence_data, dict) and 'fret' in sequence_data:
+            # 新的字典格式：包含整个序列的fret和technique
+            frets_data = sequence_data['fret']
+            techniques_data = sequence_data.get('technique')
+
+            # 转换为列表格式（如果是张量）
+            if isinstance(frets_data, Tensor):
+                frets_list = frets_data.tolist()
+            elif isinstance(frets_data, list):
+                frets_list = frets_data
+            else:
+                raise ValueError(f"fret数据格式不支持: {type(frets_data)}")
+
+            # 检查technique数据
+            if techniques_data is None:
+                # 如果没有提供technique，使用默认的NORMAL技巧
+                techniques_list = [[GuitarTechnique.NORMAL.value] * 6 for _ in range(len(frets_list))]
+            else:
+                # 处理technique数据
+                if isinstance(techniques_data, Tensor):
+                    techniques_list = techniques_data.tolist()
+                elif isinstance(techniques_data, list):
+                    techniques_list = techniques_data
+                else:
+                    raise ValueError(f"technique数据格式不支持: {type(techniques_data)}")
+
+                # 检查形状匹配
+                if len(techniques_list) != len(frets_list):
+                    raise ValueError(f"fret和technique的长度不匹配: {len(frets_list)} vs {len(techniques_list)}")
+
+                # 处理technique的形状
+                for i in range(len(techniques_list)):
+                    tech = techniques_list[i]
+                    if isinstance(tech, int):
+                        # 单个int：所有弦使用同一技巧
+                        techniques_list[i] = [tech] * 6
+                    elif isinstance(tech, list) and len(tech) == 6:
+                        # 已经是长度为6的列表
+                        pass
+                    else:
+                        raise ValueError(f"第{i + 1}个和弦technique格式错误: {tech}")
+
+            # 遍历每个和弦
+            for i in range(len(frets_list)):
+                frets = frets_list[i]
+                tech_ints = techniques_list[i]
+
+                # 验证frets长度
+                if len(frets) != 6:
+                    raise ValueError(f"第{i + 1}个和弦fret长度应为6，实际为{len(frets)}: {frets}")
+
+                # 将int技巧映射为GuitarTechnique枚举值
+                techniques = [self._map_int_to_technique(tech_int) for tech_int in tech_ints]
 
                 # 时间位置
                 sixteenth_duration = 60 / self.config.bpm / 4
@@ -425,14 +564,79 @@ class GuitarSequenceAnalyzer:
                     "index": i,
                     "time": time_position,
                     "frets": frets,
+                    "techniques": techniques,
+                    "measure_num": measure_num,
+                    "measure_pos": measure_pos,
+                    "is_line_break": measure_pos == self.config.measure_length - 1 and i < len(frets_list) - 1
+                })
+
+        elif isinstance(sequence_data, (list, tuple)):
+            # 旧格式：和弦列表
+            for i, chord_data in enumerate(sequence_data):
+                frets = []
+                techniques = []
+
+                if isinstance(chord_data, (list, tuple)):
+                    # 旧格式：纯列表，只有fret
+                    if len(chord_data) == 6:
+                        frets = list(chord_data)
+                        techniques = [GuitarTechnique.NORMAL] * 6
+                    elif len(chord_data) == 2 and isinstance(chord_data[0], (list, tuple)) and len(chord_data[0]) == 6:
+                        # 兼容格式：[fret_list, technique_list]
+                        frets = list(chord_data[0])
+                        tech_input = chord_data[1]
+
+                        if isinstance(tech_input, int):
+                            # 单个int技巧
+                            tech_value = self._map_int_to_technique(tech_input)
+                            techniques = [tech_value] * 6
+                        elif isinstance(tech_input, (list, tuple)) and len(tech_input) == 6:
+                            # 每弦一个技巧
+                            techniques = [self._map_int_to_technique(tech_int) for tech_int in tech_input]
+                        else:
+                            raise ValueError(f"第{i + 1}个和弦技巧格式错误: {chord_data}")
+                    else:
+                        raise ValueError(f"第{i + 1}个和弦格式错误: {chord_data}")
+                else:
+                    raise ValueError(f"第{i + 1}个和弦格式错误: {chord_data}")
+
+                # 验证frets长度
+                if len(frets) != 6:
+                    raise ValueError(f"第{i + 1}个和弦fret长度应为6，实际为{len(frets)}: {frets}")
+
+                # 验证techniques长度
+                if len(techniques) != 6:
+                    raise ValueError(f"第{i + 1}个和弦technique长度应为6，实际为{len(techniques)}: {techniques}")
+
+                # 时间位置
+                sixteenth_duration = 60 / self.config.bpm / 4
+                time_position = i * sixteenth_duration
+                measure_num = i // self.config.measure_length
+                measure_pos = i % self.config.measure_length
+
+                parsed.append({
+                    "index": i,
+                    "time": time_position,
+                    "frets": frets,
+                    "techniques": techniques,
                     "measure_num": measure_num,
                     "measure_pos": measure_pos,
                     "is_line_break": measure_pos == self.config.measure_length - 1 and i < len(sequence_data) - 1
                 })
-            else:
-                raise ValueError(f"第{i + 1}个和弦格式错误: {chord_data}")
+        else:
+            raise ValueError(f"序列数据格式不支持: {type(sequence_data)}")
 
         return parsed
+
+    def _map_int_to_technique(self, tech_int: int) -> GuitarTechnique:
+        """将int映射为GuitarTechnique枚举值"""
+        try:
+            # 尝试直接通过值获取枚举
+            return GuitarTechnique(tech_int)
+        except ValueError:
+            # 如果值不在枚举定义中，记录警告并返回NORMAL
+            print(f"警告: 未知的技巧值 {tech_int}，将使用 NORMAL 替代")
+            return GuitarTechnique.NORMAL
 
     def evaluate(self, sequence_data) -> float:
         report = self.analyze_sequence(sequence_data)
@@ -454,13 +658,17 @@ class GuitarSequenceAnalyzer:
         position_difficulties = []
 
         for chord_info in sequence:
-            # 位置分析
-            pos_info = self.position_analyzer.analyze_position(chord_info["frets"])
+            # 位置分析 - 现在传递技巧信息
+            pos_info = self.position_analyzer.analyze_position(
+                chord_info["frets"],
+                chord_info["techniques"]  # 新增技巧参数（枚举值）
+            )
             pos_info.update({
                 "time": chord_info["time"],
                 "index": chord_info["index"],
                 "measure_num": chord_info["measure_num"],
-                "is_line_break": chord_info["is_line_break"]
+                "is_line_break": chord_info["is_line_break"],
+                "techniques": chord_info["techniques"]  # 保留技巧信息
             })
 
             positions.append(pos_info)
@@ -482,12 +690,13 @@ class GuitarSequenceAnalyzer:
             if time_interval <= 0:
                 time_interval = 60 / self.config.bpm / 4
 
-            # 移动分析
+            # 移动分析 - 技巧会影响移动难度
             move_info = self.move_analyzer.calculate_move_difficulty(pos1, pos2, time_interval)
             move_info.update({
                 "from_index": i,
                 "to_index": i + 1,
-                "is_cross_measure": pos1["measure_num"] != pos2["measure_num"]
+                "is_cross_measure": pos1["measure_num"] != pos2["measure_num"],
+                "technique_changes": self._analyze_technique_changes(pos1["techniques"], pos2["techniques"])
             })
 
             moves.append(move_info)
@@ -511,6 +720,21 @@ class GuitarSequenceAnalyzer:
         )
 
         return report
+
+    def _analyze_technique_changes(self, tech1: List[GuitarTechnique], tech2: List[GuitarTechnique]) -> Dict:
+        """分析技巧变化"""
+        changes = {
+            "total_changes": 0,
+            "specific_changes": {}
+        }
+
+        for i in range(6):
+            if tech1[i] != tech2[i]:
+                changes["total_changes"] += 1
+                change_key = f"{tech1[i].name}->{tech2[i].name}"
+                changes["specific_changes"][change_key] = changes["specific_changes"].get(change_key, 0) + 1
+
+        return changes
 
     def calculate_accumulated_difficulty(self, pos_diffs, move_diffs):
         """计算累计难度"""

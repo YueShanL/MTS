@@ -89,6 +89,11 @@ class MidiVersionComparator:
 
         return features
 
+    def evaluate(self, pm1: pretty_midi.PrettyMIDI,
+                pm2: pretty_midi.PrettyMIDI,
+                use_dtw: bool = True):
+        return self.compare(pm1, pm2, use_dtw)['avg_cosine_similarity']
+
     def compare(self, pm1: pretty_midi.PrettyMIDI,
                 pm2: pretty_midi.PrettyMIDI,
                 use_dtw: bool = True) -> Dict:

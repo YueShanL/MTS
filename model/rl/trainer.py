@@ -4,336 +4,666 @@ import json
 import logging
 import os
 import random
+from dataclasses import dataclass, field
+from logging import Logger
 from typing import Any, Dict, List
+import guitarpro as gp
 
 import numpy as np
 import torch
-from mts_generate import MTSGen
-from simulator import GuitarSequenceAnalyzer
-from mid_comparitor import MidiVersionComparator
+from torch.utils.data import DataLoader
 
-from torch import optim
+from model.dataset import decode
+from model.mts_generate import MTSGen
+from model.rl.simulator import GuitarSequenceAnalyzer
+from model.rl.mid_comparitor import MidiVersionComparator, midi_to_pretty_midi
+
+from torch import optim, Tensor
+
+from utils.gp2mid import gp5_to_midi
+
+
+@dataclass
+class RLConfig:
+    """强化学习训练配置"""
+    # 训练参数
+    num_epochs: int = 50
+    batch_size: int = 8
+    learning_rate: float = 1e-5
+    weight_decay: float = 1e-4
+
+    # 生成与温度参数
+    generate_length: int = 64
+    initial_temp: float = 0.6
+    min_temp: float = 0.1
+    temp_decay: float = 1 - 1e4
+    exploration_temp_factor: float = 5.0  # 探索温度倍数
+
+    # 经验回放与探索
+    replay_buffer_size: int = 10000
+    reward_threshold: float = 0.7
+    exploration_interval: int = 10  # 每N步进行一次高温探索
+    exploration_reward_threshold: float = 0.6  # 探索经验的最低奖励阈值
+
+    # 奖励权重与函数
+    reward_weights: Dict[str, float] = field(default_factory=lambda: {"difficulty": 0.6, "similarity": 1.0})
+    complexity_weight: float = 0.1  # 复杂性奖励权重
+
+    # 训练频率
+    collect_freq: int = 2
+    eval_freq: int = 5
+    checkpoint_freq: int = 10
+    log_interval: int = 10
+    update_frequency: int = 1
+
+    # 梯度裁剪与数据加载
+    grad_clip: float = 1.0
+    num_workers: int = 4
+
+    # 路径配置
+    save_dir: str = "./rl_training_results"
+
+    dataset_limit: int = None
+
+    def difficulty_fn(self, param):
+        return 10/(param + 10)
+
+    def similarity_fn(self, param):
+        return param
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    def save(self, path: str):
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> 'RLConfig':
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return cls(**data)
+
+
+class TestRLConfig(RLConfig):
+    """测试配置"""
+    def __init__(self):
+        super().__init__(**self.to_dict())
+        self.num_epochs: int = 10
+        self.batch_size: int = 1
+        self.num_workers: int = 1
+
+        self.replay_buffer_size: int = 10
+        self.exploration_interval: int = 5
+
+        self.dataset_limit = 10
+
 
 class RLTrainer:
-    """强化学习训练器"""
-    
+    """强化学习训练器（集成FIFO经验池与高温探索）"""
+
     def __init__(self, model: MTSGen, difficulty_system: GuitarSequenceAnalyzer,
                  similarity_system: MidiVersionComparator, config: RLConfig):
+        self.logger = Logger("RLTrainer")
+        self.loss_history = []
+        self.device = model.device
         self.model = model
         self.difficulty_system = difficulty_system
         self.similarity_system = similarity_system
         self.config = config
-        
+
         # 优化器
         self.optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=config.num_epochs
         )
-        
-        # 经验回放缓冲区
+
+        # FIFO经验回放缓冲区
         self.replay_buffer = deque(maxlen=config.replay_buffer_size)
-        
-        # 目标序列（用于相似度计算）
-        self.target_sequence = None
-        
+
         # 训练状态
         self.temperature = config.initial_temp
+        self.exploration_temp = config.initial_temp * config.exploration_temp_factor
         self.step_count = 0
         self.reward_history = []
-        
+
+        # 定义输出头权重（可以根据任务重要性调整）
+        self.output_weights = {
+            'fret': 1.0,
+            'technique': 0.5,
+            'duration': 0.3,
+            'velocity': 0.2,
+            'string': 0.2
+        }
+
         # 日志
         self.setup_logging()
-        
+        self.logger.info(f"初始化RL训练器，设备: {self.device}")
+        self.logger.info(f"输出头权重: {self.output_weights}")
+
+    def train_step(self, batch_size: int = 32) -> Dict[str, float]:
+        """强化学习训练步骤 - 多头输出版本"""
+
+        # 1. 从经验池采样
+        buffer_list = list(self.replay_buffer)
+        batch_experiences = random.sample(buffer_list, min(batch_size, len(buffer_list)))
+
+        # 准备输入数据
+        audio_inputs = []
+        sequences = []
+        rewards_list = []
+
+        for exp in batch_experiences:
+            audio_inputs.append(exp["audio_features"])
+            sequences.append(exp["sequence"])
+            rewards_list.append(exp["rewards"]["total"])
+
+        # 转换为张量
+        audio_tensor = torch.stack(audio_inputs).to(self.device)
+        rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).to(self.device)
+
+        # 2. 准备Teacher Forcing输入（使用经验中的序列作为目标）
+        tf_inputs = self._prepare_teacher_forcing_inputs(sequences)
+
+        # 3. Teacher Forcing前向传播 - 获取logits（行为策略）
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        # 行为策略（旧的，用于采样）
+        with torch.no_grad():
+            behavior_output = self.model(
+                audio_tensor,
+                teacher_forcing=True,
+                target_notes=tf_inputs,  # 使用经验中的序列
+            )
+
+        # 4. 从行为策略采样
+        sampled_actions = self.model._sample_next_note(behavior_output, self.temperature)
+
+        # 5. 计算行为策略的对数概率
+        behavior_log_probs = self._compute_log_probs_dict(behavior_output, sampled_actions)
+
+        # 6. 计算目标策略（当前模型）的对数概率
+        target_output = self.model(
+            audio_tensor,
+            teacher_forcing=True,
+            target_notes=sampled_actions,  # 使用采样得到的动作
+        )
+        target_log_probs = self._compute_log_probs_dict(target_output, sampled_actions)
+
+        # 7. 计算重要性采样比率（用于Off-policy）
+        log_ratios = {}
+        for key in behavior_log_probs.keys():
+            if key in target_log_probs:
+                log_ratios[key] = target_log_probs[key] - behavior_log_probs[key].detach()
+
+        # 8. 计算优势函数（标准化奖励）
+        advantages = self._compute_advantages(rewards_tensor)
+
+        # 9. 计算PPO风格的损失
+        total_loss = torch.tensor(0.0, device=self.device)
+        policy_losses = {}
+        value_losses = {}
+
+        for key in log_ratios.keys():
+            if key in self.output_weights:
+                weight = self.output_weights[key]
+                log_ratio = log_ratios[key]
+                ratio = torch.exp(log_ratio)
+
+                # PPO Clip损失
+                clip_epsilon = 0.2
+                surrogate1 = ratio * advantages.expand_as(ratio)
+                surrogate2 = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon) * advantages.expand_as(
+                    ratio)
+
+                # 加权策略损失
+                policy_loss = -torch.min(surrogate1, surrogate2).mean()
+                policy_losses[key] = policy_loss.item()
+                total_loss += weight * policy_loss
+
+        # 10. 添加熵正则化
+        entropy_loss = self._compute_entropy_dict(target_output)
+        entropy_coef = 0.01
+        total_loss -= entropy_coef * entropy_loss
+
+        # 11. 反向传播
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+        self.optimizer.step()
+
+        # 12. 评估新策略并更新经验池
+        self._evaluate_and_update_buffer(audio_tensor, sampled_actions, rewards_tensor, batch_experiences)
+
+        # 13. 更新状态
+        self.loss_history.append(total_loss.item())
+        self.step_count += 1
+        self.temperature = max(self.config.min_temp, self.temperature * self.config.temp_decay)
+
+        # 14. 返回统计
+        stats = {
+            "loss": total_loss.item(),
+            "avg_reward": rewards_tensor.mean().item(),
+            "reward_std": rewards_tensor.std().item(),
+            "buffer_size": len(self.replay_buffer),
+            "temperature": self.temperature,
+            "entropy": entropy_loss.item(),
+        }
+
+        # 添加各头的损失
+        for key, loss_val in policy_losses.items():
+            stats[f"{key}_policy_loss"] = loss_val
+        for key, loss_val in value_losses.items():
+            stats[f"{key}_value_loss"] = loss_val
+
+        return stats
+
+    def _prepare_teacher_forcing_inputs(self, sequences: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """准备Teacher Forcing输入（多头版本）"""
+        # 收集所有可能的关键字
+        all_keys = set()
+        for seq in sequences:
+            if isinstance(seq, dict):
+                all_keys.update(seq.keys())
+
+        # 为每个关键字创建张量列表
+        tensor_dict = {}
+        for key in all_keys:
+            tensor_dict[key] = []
+
+        # 填充数据
+        for seq in sequences:
+            if isinstance(seq, dict):
+                for key in all_keys:
+                    tensor_dict[key].append(seq[key].to(self.device))
+
+        # 堆叠并移动到设备
+        result = {}
+        for key, tensor_list in tensor_dict.items():
+            if tensor_list:
+                result[key] = torch.stack(tensor_list).to(self.device)
+
+        return result
+
+    def _compute_log_probs_dict(self, logits_dict: Dict[str, torch.Tensor],
+                                actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """计算字典形式logits的对数概率 - 确保梯度"""
+        log_probs = {}
+
+        for key, logits in logits_dict.items():
+            action_key = key
+
+            action = actions[action_key]
+
+            # 确保logits需要梯度
+            if isinstance(logits, torch.Tensor) and not logits.requires_grad:
+                logits = logits.requires_grad_(True)
+
+            # 计算对数概率
+            log_probs_tensor = torch.log_softmax(logits, dim=-1)
+
+            # 收集动作对应的对数概率
+            if logits.dim() == 4 and action.dim() == 3:
+                # logits: [B, T, 6, N], action: [B, T, 6]
+                action_expanded = action.unsqueeze(-1).long()  # [B, T, 6, 1]
+                log_prob = torch.gather(log_probs_tensor, -1, action_expanded).squeeze(-1)  # [B, T, 6]
+
+                # 在弦和序列维度取平均
+                log_probs[action_key] = log_prob.mean(dim=[1, 2])  # [B]
+
+            elif logits.dim() == 3 and action.dim() == 2:
+                # logits: [B, T, N], action: [B, T]
+                action_expanded = action.unsqueeze(-1).long()  # [B, T, 1]
+                log_prob = torch.gather(log_probs_tensor, -1, action_expanded).squeeze(-1)  # [B, T]
+
+                # 在序列维度取平均
+                log_probs[action_key] = log_prob.mean(dim=-1)  # [B]
+
+        return log_probs
+
+    def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        """计算优势函数（标准化奖励）"""
+        if rewards.std() > 0:
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        else:
+            advantages = rewards - rewards.mean()
+        return advantages
+
+    def _compute_entropy_dict(self, logits_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """计算字典形式logits的熵（多头版本）"""
+        total_entropy = torch.tensor(0.0, device=self.device)
+        count = 0
+
+        for key, logits in logits_dict.items():
+            probs = torch.softmax(logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+            total_entropy += entropy
+            count += 1
+
+        if count > 0:
+            return total_entropy / count
+        else:
+            return total_entropy
+
+    def _evaluate_and_update_buffer(self, audio_tensor: torch.Tensor,
+                                    sampled_actions: Dict[str, torch.Tensor],
+                                    rewards_tensor: torch.Tensor,
+                                    old_experiences: List[Dict[str, Any]]):
+        """评估新策略并更新经验池"""
+        with torch.no_grad():
+            self.model.eval()
+
+            batch_size = audio_tensor.shape[0]
+            for i in range(batch_size):
+                # 构建序列字典
+                seq_dict = {}
+                for key, tensor in sampled_actions.items():
+                    seq_dict[key] = tensor[i].cpu()
+
+                # 计算新奖励
+                target_midi = old_experiences[i].get("target_midi")
+                new_rewards = self.calculate_reward(seq_dict, target_midi)
+                new_reward = new_rewards["total"]
+                old_reward = old_experiences[i]["rewards"]["total"]
+
+                # 保留更好的经验
+                improvement_threshold = 0.05  # 至少提升5%
+                if new_reward > old_reward * (1 + improvement_threshold):
+                    self.logger.debug(f'update data with rewards: {new_rewards}')
+                    experience = {
+                        "sequence": seq_dict,
+                        "rewards": new_rewards,
+                        "audio_features": old_experiences[i]["audio_features"].clone(),
+                        "target_midi": target_midi,
+                        "step": self.step_count,
+                        "source": "policy_update",
+                        "temperature": self.temperature,
+                        "improvement": new_reward - old_reward
+                    }
+
+                    # 添加到FIFO缓冲区
+                    self.replay_buffer.append(experience)
+
+            self.model.train()
+
+    def collect_experience(self, batch: Dict[str, Any]):
+        """
+        收集经验 - 多头输出版本
+        """
+        self.model.eval()
+        self.logger.debug(f'collecting experience')
+
+        with torch.no_grad():
+            audio_input = batch['audio_input'].to(self.device)
+            batch_size = audio_input.shape[0]
+
+            # 决定使用探索温度还是标准温度
+            use_exploration_temp = (self.step_count % self.config.exploration_interval == 0)
+            current_temp = self.exploration_temp if use_exploration_temp else self.temperature
+
+            if use_exploration_temp: self.logger.debug(f'current exploration temp: {current_temp}')
+
+            # 生成序列
+            generated_output = self.model(
+                audio_input,
+                teacher_forcing=False,
+                generate_length=self.config.generate_length,
+                temperature=current_temp,
+                do_sample=True,
+                return_logits=False
+            )
+
+            # 处理多头输出
+            sequences = self._process_multihead_output(generated_output, batch_size)
+
+            # 评估并存储经验
+            for i in range(batch_size):
+                seq = sequences[i] if i < len(sequences) else sequences[0]
+                target_midi = batch['mid_input'][i] if i < len(batch['mid_input']) else None
+
+                # 计算奖励
+                rewards = self.calculate_reward(seq, target_midi)
+
+                # 准备序列数据（确保是字典格式）
+                if not isinstance(seq, dict):
+                    # 如果是张量，假设是fret序列
+                    seq_dict = {
+                        'fret': seq,
+                        'technique': torch.zeros_like(seq),
+                        'duration': torch.zeros(seq.shape[0], dtype=torch.float32)
+                    }
+                else:
+                    seq_dict = seq
+
+                # 创建经验
+                experience = {
+                    "sequence": seq_dict,
+                    "rewards": rewards,
+                    "audio_features": batch['audio_input'][i].cpu().clone(),
+                    "target_midi": target_midi,
+                    "step": self.step_count,
+                    "temperature": current_temp,
+                    "source": "exploration" if use_exploration_temp else "standard"
+                }
+
+                # 添加到FIFO缓冲区
+                self.replay_buffer.append(experience)
+
+                # 记录高质量经验
+                if rewards["total"] > self.config.reward_threshold:
+                    self.logger.debug(f"高质量经验: 奖励={rewards['total']:.3f}, 来源={experience['source']}")
+
+
+        # 更新温度（退火）
+        self.temperature = max(
+            self.config.min_temp,
+            self.temperature * self.config.temp_decay
+        )
+        self.exploration_temp = max(
+            self.config.min_temp * 1.5,
+            self.exploration_temp * self.config.temp_decay
+        )
+
+        self.step_count += 1
+
+    def _process_multihead_output(self, output, batch_size: int) -> List[Any]:
+        """处理多头输出，返回序列列表"""
+        if isinstance(output, dict):
+            # 如果是字典，提取每个样本
+            sequences = []
+            for i in range(batch_size):
+                sample_dict = {}
+                for key, value in output.items():
+                    if isinstance(value, torch.Tensor) and value.dim() > 0:
+                        if value.shape[0] == batch_size:
+                            sample_value = value[i]
+                        else:
+                            sample_value = value
+                    else:
+                        sample_value = value
+
+                    # 去掉_logits后缀（如果是logits）
+                    if key.endswith('_logits'):
+                        key = key.replace('_logits', '')
+
+                    sample_dict[key] = sample_value
+                sequences.append(sample_dict)
+            return sequences
+        else:
+            # 如果是张量或其他格式
+            return [output[i] for i in range(batch_size)]
+
     def setup_logging(self):
         """设置日志"""
         os.makedirs(self.config.save_dir, exist_ok=True)
-        log_file = os.path.join(self.config.save_dir, f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-        
+        log_file = os.path.join(
+            self.config.save_dir,
+            f"training_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(log_file),
                 logging.StreamHandler()
             ]
         )
         self.logger = logging.getLogger(__name__)
-    
-    def set_target_sequence(self, sequence: List[List[int]]):
-        """设置目标序列（用于相似度计算）"""
-        self.target_sequence = sequence
-        self.logger.info(f"设置目标序列，长度: {len(sequence)}")
-    
-    def calculate_reward(self, sequence: List[List[int]]) -> Dict[str, float]:
-        """计算综合奖励"""
+
+    def calculate_reward(self, generated_sequence, target_midi) -> Dict[str, float]:
         rewards = {}
-        
+
         # 1. 难度奖励
-        difficulty_result = self.difficulty_system.evaluate(sequence)
-        difficulty_reward = difficulty_result["total"]
-        rewards["difficulty"] = difficulty_reward
-        
-        # 2. 相似度奖励（如果有目标序列）
-        if self.target_sequence is not None:
-            similarity_result = self.similarity_system.evaluate(sequence, self.target_sequence)
-            similarity_reward = similarity_result["total"]
-            rewards["similarity"] = similarity_reward
+        difficulty_reward = self.difficulty_system.evaluate(generated_sequence)
+        rewards["difficulty"] = float(difficulty_reward)
+
+        # 2. 相似度奖励
+        if target_midi is not None:
+            generated_midi = midi_to_pretty_midi(gp5_to_midi(decode(generated_sequence, post_process=False), None))
+            # 检查是否有音符
+            source_has_notes = any(len(instr.notes) > 0 for instr in target_midi.instruments)
+            target_has_notes = any(len(instr.notes) > 0 for instr in generated_midi.instruments)
+
+            if source_has_notes and target_has_notes:
+                similarity_reward = self.similarity_system.evaluate(generated_midi, target_midi)
+            elif not source_has_notes and not target_has_notes:
+                similarity_reward = 1.0
+            else:
+                similarity_reward = 0.0 if not source_has_notes else -100.0
+                self.logger.warning(f'invalid midi format: expect notes > 0 but get 0 at {"source" if not source_has_notes else "target"}')
+            rewards["similarity"] = float(similarity_reward)
         else:
             rewards["similarity"] = 0.0
-        
-        # 3. 多样性奖励（鼓励探索）
-        diversity_reward = self.calculate_diversity_reward(sequence)
-        rewards["diversity"] = diversity_reward
-        
-        # 4. 音乐性奖励（基于一些音乐规则）
-        musical_reward = self.calculate_musical_reward(sequence)
-        rewards["musicality"] = musical_reward
-        
-        # 综合奖励
-        total_reward = (
-            rewards["difficulty"] * self.config.reward_weights["difficulty"] +
-            rewards["similarity"] * self.config.reward_weights["similarity"] +
-            rewards["diversity"] * self.config.reward_weights["diversity"] +
-            rewards["musicality"] * 0.1  # 额外的小权重
-        )
-        rewards["total"] = total_reward
-        
+
+        # 综合奖励（应用变换函数和权重）
+        total_reward = Tensor([
+            self.config.difficulty_fn(rewards["difficulty"]) * self.config.reward_weights.get("difficulty", 1.0),
+            self.config.similarity_fn(rewards["similarity"]) * self.config.reward_weights.get("similarity", 1.0),
+        ])
+
+        rewards["total"] = float(total_reward.sum())
+
+
         # 记录奖励历史
         self.reward_history.append({
             "step": self.step_count,
             "rewards": rewards,
-            "sequence_length": len(sequence)
+            "source": "exploration" if self.step_count % self.config.exploration_interval == 0 else "standard"
         })
-        
+
         return rewards
-    
-    def calculate_diversity_reward(self, sequence: List[List[int]]) -> float:
-        """计算多样性奖励"""
-        if len(self.replay_buffer) < 2:
-            return 0.5
-        
-        # 计算当前序列与回放缓冲区中序列的相似度
-        similarities = []
-        for buffer_seq in list(self.replay_buffer)[-10:]:  # 检查最近10个
-            sim_result = self.similarity_system.evaluate(sequence, buffer_seq)
-            similarities.append(sim_result["total"])
-        
-        if not similarities:
-            return 0.5
-        
-        avg_similarity = np.mean(similarities)
-        
-        # 多样性奖励：与已有序列越不相似，奖励越高
-        diversity_reward = 1.0 - avg_similarity
-        return diversity_reward
-    
-    def calculate_musical_reward(self, sequence: List[List[int]]) -> float:
-        """计算音乐性奖励（基于简单规则）"""
-        if not sequence:
-            return 0.0
-        
-        musical_score = 0.0
-        
-        for i, chord in enumerate(sequence):
-            # 检查空弦（0品）使用
-            if 0 in chord:
-                musical_score += 0.1
-            
-            # 检查是否有演奏的弦
-            active_strings = [f for f in chord if f < 25]
-            if 1 <= len(active_strings) <= 3:
-                musical_score += 0.2  # 鼓励1-3个音的简洁演奏
-            
-            # 检查和弦是否合理（相邻品位差不太大）
-            if len(active_strings) >= 2:
-                active_strings.sort()
-                max_diff = max(active_strings) - min(active_strings)
-                if max_diff <= 5:  # 合理的手指跨度
-                    musical_score += 0.3
-        
-        # 检查序列变化
-        if len(sequence) > 1:
-            changes = 0
-            for i in range(1, len(sequence)):
-                if sequence[i] != sequence[i-1]:
-                    changes += 1
-            change_ratio = changes / (len(sequence) - 1)
-            # 鼓励适度的变化（既不太单调也不太大变化）
-            if 0.3 <= change_ratio <= 0.7:
-                musical_score += 0.5
-        
-        return musical_score / (len(sequence) + 1)
-    
-    def generate_sequence(self, batch_size: int = 1) -> List[List[List[int]]]:
-        """生成序列"""
-        # 随机起始标记
-        start_tokens = torch.randint(0, 26, (batch_size, 1, 6))
-        
-        # 生成序列
-        with torch.no_grad():
-            generated = self.model.generate(
-                start_tokens, 
-                self.config.sequence_length,
-                temperature=self.temperature
-            )
-        
-        # 转换为Python列表
-        sequences = []
-        for i in range(batch_size):
-            seq = generated[i].cpu().numpy().tolist()  # (seq_len, 6)
-            sequences.append(seq)
-        
-        return sequences
-    
-    def collect_experience(self, num_sequences: int = 16):
-        """收集经验"""
-        sequences = self.generate_sequence(num_sequences)
-        
-        for seq in sequences:
-            # 计算奖励
-            rewards = self.calculate_reward(seq)
-            
-            # 转换为张量
-            seq_tensor = torch.tensor(seq, dtype=torch.long)  # (seq_len, 6)
-            
-            # 存储到回放缓冲区
-            experience = {
-                "sequence": seq_tensor,
-                "rewards": rewards,
-                "step": self.step_count
-            }
-            self.replay_buffer.append(experience)
-        
-        self.step_count += 1
-        
-        # 更新温度（退火）
-        self.temperature = max(
-            self.config.min_temp,
-            self.temperature * self.config.temp_decay
-        )
-    
-    def compute_policy_gradient_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """计算策略梯度损失"""
-        sequences = batch["sequence"]  # (batch_size, seq_len, 6)
-        rewards = batch["reward"]  # (batch_size,)
-        
-        # 获取模型预测
-        logits = self.model(sequences)  # (batch_size, seq_len, 6, 26)
-        
-        # 计算对数概率
-        log_probs = []
-        for b in range(sequences.shape[0]):
-            seq_log_probs = []
-            for t in range(sequences.shape[1]):
-                for s in range(6):
-                    token = sequences[b, t, s]
-                    log_prob = torch.log_softmax(logits[b, t, s, :], dim=0)[token]
-                    seq_log_probs.append(log_prob)
-            seq_total_log_prob = torch.stack(seq_log_probs).mean()
-            log_probs.append(seq_total_log_prob)
-        
-        log_probs = torch.stack(log_probs)
-        
-        # 归一化奖励
-        if rewards.std() > 0:
-            normalized_rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-        else:
-            normalized_rewards = rewards - rewards.mean()
-        
-        # 策略梯度损失
-        loss = -(log_probs * normalized_rewards).mean()
-        
-        return loss
-    
-    def train_step(self, batch_size: int = 32) -> Dict[str, float]:
-        """单步训练"""
-        if len(self.replay_buffer) < batch_size:
-            return {"loss": 0.0, "avg_reward": 0.0}
-        
-        # 从回放缓冲区采样
-        batch_experiences = random.sample(self.replay_buffer, batch_size)
-        
-        # 准备批次数据
-        sequences = []
-        rewards = []
-        
-        for exp in batch_experiences:
-            sequences.append(exp["sequence"])
-            rewards.append(exp["rewards"]["total"])
-        
-        sequences_tensor = torch.stack(sequences)
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
-        
-        batch = {
-            "sequence": sequences_tensor,
-            "reward": rewards_tensor
-        }
-        
-        # 训练
-        self.model.train()
-        self.optimizer.zero_grad()
-        
-        loss = self.compute_policy_gradient_loss(batch)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        self.optimizer.step()
-        
-        # 更新学习率
-        self.scheduler.step()
-        
-        # 记录统计
-        stats = {
-            "loss": loss.item(),
-            "avg_reward": rewards_tensor.mean().item(),
-            "std_reward": rewards_tensor.std().item(),
-            "temperature": self.temperature,
-            "buffer_size": len(self.replay_buffer)
-        }
-        
-        return stats
-    
-    def evaluate(self, num_sequences: int = 10) -> Dict[str, Any]:
+
+    def evaluate(self, dataloader: DataLoader, num_batches: int = 5) -> Dict[str, Any]:
         """评估当前模型"""
         self.model.eval()
-        
-        # 生成测试序列
-        test_sequences = self.generate_sequence(num_sequences)
-        
-        # 计算奖励统计
+
         all_rewards = []
         difficulty_scores = []
         similarity_scores = []
-        
-        for seq in test_sequences:
-            rewards = self.calculate_reward(seq)
-            all_rewards.append(rewards["total"])
-            difficulty_scores.append(rewards["difficulty"])
-            similarity_scores.append(rewards["similarity"])
-        
-        # 保存最佳序列
-        best_idx = np.argmax(all_rewards)
-        best_sequence = test_sequences[best_idx]
-        best_rewards = self.calculate_reward(best_sequence)
-        
-        eval_stats = {
-            "avg_total_reward": np.mean(all_rewards),
-            "std_total_reward": np.std(all_rewards),
-            "avg_difficulty": np.mean(difficulty_scores),
-            "avg_similarity": np.mean(similarity_scores),
-            "best_sequence": best_sequence,
-            "best_rewards": best_rewards
-        }
-        
+        complexity_scores = []
+        best_reward = -float('inf')
+        best_sequence = None
+
+        with torch.no_grad():
+            batch_count = 0
+            for batch in dataloader:
+                if batch_count >= num_batches:
+                    break
+
+                # 生成序列（评估使用较低温度）
+                if hasattr(self.model, 'generate_from_audio'):
+                    generated_sequences = self.model.generate_from_audio(
+                        batch['audio_input'].to(self.device),
+                        generate_length=self.config.generate_length,
+                        temperature=0.5
+                    )
+                else:
+                    generated_output = self.model(
+                        batch['audio_input'].to(self.device),
+                        teacher_forcing=False,
+                        generate_length=self.config.generate_length,
+                        temperature=0.5,
+                        do_sample=True
+                    )
+
+                    if isinstance(generated_output, dict):
+                        batch_size = batch['audio_input'].shape[0]
+                        generated_sequences = self._process_multihead_output(generated_output, batch_size)
+                    else:
+                        generated_sequences = generated_output
+
+                # 计算奖励
+                for i, (seq, target_midi) in enumerate(zip(generated_sequences, batch['mid_input'])):
+                    rewards = self.calculate_reward(seq, target_midi)
+
+                    all_rewards.append(rewards["total"])
+                    difficulty_scores.append(rewards["difficulty"])
+                    similarity_scores.append(rewards["similarity"])
+
+                    # 更新最佳序列
+                    if rewards["total"] > best_reward:
+                        best_reward = rewards["total"]
+                        best_sequence = seq
+
+                batch_count += 1
+
+        # 计算统计
+        if all_rewards:
+            eval_stats = {
+                "avg_total_reward": np.mean(all_rewards),
+                "std_total_reward": np.std(all_rewards),
+                "avg_difficulty": np.mean(difficulty_scores),
+                "avg_similarity": np.mean(similarity_scores),
+                "avg_complexity": np.mean(complexity_scores),
+                "best_sequence": best_sequence,
+                "best_reward": best_reward,
+                "num_samples": len(all_rewards)
+            }
+        else:
+            eval_stats = {
+                "avg_total_reward": 0.0,
+                "std_total_reward": 0.0,
+                "avg_difficulty": 0.0,
+                "avg_similarity": 0.0,
+                "avg_complexity": 0.0,
+                "best_sequence": None,
+                "best_reward": 0.0,
+                "num_samples": 0
+            }
+
         return eval_stats
-    
+
+    def _compute_multi_log_probs(self, output, fret_target, technique_target, duration_target):
+        """计算多任务对数概率"""
+        batch_size = fret_target.shape[0]
+        log_probs = torch.zeros(batch_size, device=self.device)
+
+        # fret部分
+        if 'fret_logits' in output:
+            fret_logits = output['fret_logits']
+            fret_probs = torch.log_softmax(fret_logits, dim=-1)
+            fret_idx = fret_target.unsqueeze(-1)
+            fret_log_probs = torch.gather(fret_probs, -1, fret_idx).squeeze(-1)
+            log_probs += fret_log_probs.mean(dim=[1, 2])
+
+        # technique部分
+        if 'technique_logits' in output:
+            technique_logits = output['technique_logits']
+            technique_probs = torch.log_softmax(technique_logits, dim=-1)
+            technique_idx = technique_target.unsqueeze(-1)
+            technique_log_probs = torch.gather(technique_probs, -1, technique_idx).squeeze(-1)
+            log_probs += technique_log_probs.mean(dim=[1, 2])
+
+        return log_probs
+
     def save_checkpoint(self, epoch: int, stats: Dict[str, Any]):
         """保存检查点"""
         checkpoint_dir = os.path.join(self.config.save_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
+
         checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt")
-        
+
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -342,84 +672,192 @@ class RLTrainer:
             "config": self.config.to_dict(),
             "stats": stats,
             "temperature": self.temperature,
+            "exploration_temp": self.exploration_temp,
             "step_count": self.step_count,
-            "reward_history": self.reward_history[-100:]  # 保存最近100条
+            "reward_history": self.reward_history[-1000:],
+            "loss_history": self.loss_history[-1000:],
+            "buffer_size": len(self.replay_buffer)
         }
-        
+
         torch.save(checkpoint, checkpoint_path)
         self.logger.info(f"检查点已保存: {checkpoint_path}")
-    
+
     def load_checkpoint(self, checkpoint_path: str):
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
+
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        
+
         self.temperature = checkpoint.get("temperature", self.config.initial_temp)
+        self.exploration_temp = checkpoint.get("exploration_temp",
+                                               self.config.initial_temp * self.config.exploration_temp_factor)
         self.step_count = checkpoint.get("step_count", 0)
-        
-        # 加载奖励历史
+
         if "reward_history" in checkpoint:
             self.reward_history = checkpoint["reward_history"]
-        
+        if "loss_history" in checkpoint:
+            self.loss_history = checkpoint["loss_history"]
+
         self.logger.info(f"从检查点加载: {checkpoint_path}")
         self.logger.info(f"恢复的训练步数: {self.step_count}")
-    
-    def train(self):
+
+    def train(self, train_dataset, val_dataset=None):
         """主训练循环"""
         self.logger.info("开始强化学习训练")
-        self.logger.info(f"配置: {json.dumps(self.config.to_dict(), indent=2)}")
-        
+        self.logger.info(f"使用设备: {self.device}")
+
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+            collate_fn=collate_fn
+        )
+
+        if val_dataset:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.config.batch_size,
+                num_workers=self.config.num_workers,
+                collate_fn=collate_fn
+            )
+
         # 保存配置
         config_path = os.path.join(self.config.save_dir, "config.json")
-        self.config.save(config_path)
-        
+        with open(config_path, 'w') as f:
+            json.dump(self.config.to_dict(), f, indent=2)
+
+        # 训练循环
         for epoch in range(self.config.num_epochs):
-            # 收集经验
-            if epoch % self.config.update_frequency == 0:
-                self.collect_experience(num_sequences=16)
-            
-            # 训练步骤
-            if self.config.use_replay_buffer and len(self.replay_buffer) >= self.config.batch_size:
-                train_stats = self.train_step(batch_size=self.config.batch_size)
-            else:
-                train_stats = {"loss": 0.0, "avg_reward": 0.0}
-            
+            epoch_losses = []
+            epoch_rewards = []
+
+            self.logger.info(f"开始第 {epoch + 1}/{self.config.num_epochs} 轮训练")
+
+            for batch_idx, batch in enumerate(train_loader):
+                if self.config.dataset_limit is not None and batch_idx * self.config.batch_size >= self.config.dataset_limit:
+                    break
+                # 收集经验（集成了高温探索）
+                if batch_idx % self.config.collect_freq == 0:
+                    self.logger.debug(f'collecting {batch_idx // self.config.collect_freq} data')
+                    self.collect_experience(batch)
+
+                # 训练步骤
+                if len(self.replay_buffer) >= self.config.batch_size:
+                    train_stats = self.train_step(batch_size=self.config.batch_size)
+                    epoch_losses.append(train_stats["loss"])
+                    epoch_rewards.append(train_stats["avg_reward"])
+
+                    # 定期记录
+                    if batch_idx % self.config.log_interval == 0:
+                        self.logger.info(
+                            f"Epoch {epoch + 1}, Batch {batch_idx}: "
+                            f"Loss: {train_stats['loss']:.4f}, "
+                            f"Avg Reward: {train_stats['avg_reward']:.4f}, "
+                            f"Buffer: {train_stats['buffer_size']}, "
+                            f"Temp: {self.temperature:.3f}"
+                        )
+
+            # 计算轮次统计
+            avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+            avg_epoch_reward = np.mean(epoch_rewards) if epoch_rewards else 0.0
+
             # 评估
-            if epoch % self.config.eval_freq == 0:
-                eval_stats = self.evaluate(num_sequences=5)
-                
-                # 记录日志
+            if (epoch + 1) % self.config.eval_freq == 0:
+                eval_stats = self.evaluate(val_loader if val_dataset else train_loader, num_batches=3)
+
                 self.logger.info(
-                    f"Epoch {epoch}: "
-                    f"Loss: {train_stats['loss']:.4f}, "
-                    f"Avg Reward: {train_stats['avg_reward']:.4f}, "
+                    f"Epoch {epoch + 1} 评估结果: "
+                    f"Train Loss: {avg_epoch_loss:.4f}, "
+                    f"Train Reward: {avg_epoch_reward:.4f}, "
                     f"Eval Reward: {eval_stats['avg_total_reward']:.4f}, "
-                    f"Temp: {self.temperature:.3f}"
+                    f"Difficulty: {eval_stats['avg_difficulty']:.3f}, "
+                    f"Similarity: {eval_stats['avg_similarity']:.3f}, "
                 )
-                
+
                 # 保存最佳序列
-                if epoch % (self.config.eval_freq * 5) == 0:
-                    best_seq = eval_stats["best_sequence"]
-                    best_rewards = eval_stats["best_rewards"]
-                    
-                    seq_path = os.path.join(self.config.save_dir, f"best_sequence_epoch_{epoch}.json")
+                if eval_stats['best_sequence'] is not None:
+                    seq_path = os.path.join(self.config.save_dir, f"best_sequence_epoch_{epoch + 1:04d}.json")
                     with open(seq_path, 'w') as f:
                         json.dump({
-                            "sequence": best_seq,
-                            "rewards": best_rewards,
-                            "epoch": epoch
+                            "reward": eval_stats['best_reward'],
+                            "epoch": epoch + 1
                         }, f, indent=2)
-            
+
             # 保存检查点
-            if epoch % self.config.checkpoint_freq == 0 and epoch > 0:
-                self.save_checkpoint(epoch, train_stats)
-        
+            if (epoch + 1) % self.config.checkpoint_freq == 0:
+                self.save_checkpoint(epoch + 1, {
+                    "avg_loss": avg_epoch_loss,
+                    "avg_reward": avg_epoch_reward,
+                    "eval_stats": eval_stats if (epoch + 1) % self.config.eval_freq == 0 else None
+                })
+                if eval_stats['best_sequence'] is not None:
+                    checkpoint_dir = os.path.join(self.config.save_dir, "checkpoints")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    gp.write(decode(eval_stats['best_sequence']), f'{checkpoint_dir}/out.gp5')
+
         self.logger.info("训练完成")
-        
+
         # 保存最终模型
         final_path = os.path.join(self.config.save_dir, "final_model.pt")
         torch.save(self.model.state_dict(), final_path)
         self.logger.info(f"最终模型已保存: {final_path}")
+
+    def _move_to_device(self, batch):
+        """移动批次数据到设备"""
+        device = next(self.model.parameters()).device
+
+        if 'audio_input' in batch:
+            batch['audio_input'] = batch['audio_input'].to(device)
+
+        for key in ['context_notes', 'target_notes']:
+            if key in batch:
+                for subkey in batch[key]:
+                    batch[key][subkey] = batch[key][subkey].to(device)
+
+        return batch
+
+
+def collate_fn(batch):
+    """处理数据加载器的批次"""
+    if not batch:
+        return {}
+
+    audio_list = []
+    mid_list = []
+
+    for sample in batch:
+        if isinstance(sample, tuple) and len(sample) == 2:
+            audio_tensor, midi = sample
+        else:
+            continue
+
+        # 确保音频张量是3D的: [batch,1,time]
+        if audio_tensor.dim() == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+
+        audio_list.append(audio_tensor)
+        mid_list.append(midi)
+
+    if not audio_list:
+        return {}
+
+    # 堆叠音频张量
+    try:
+        audio_batch = torch.stack(audio_list, dim=0)
+    except:
+        max_len = max(a.shape[-1] for a in audio_list)
+        padded_audio = []
+        for a in audio_list:
+            pad_size = max_len - a.shape[-1]
+            if pad_size > 0:
+                a = torch.nn.functional.pad(a, (0, pad_size))
+            padded_audio.append(a)
+        audio_batch = torch.stack(padded_audio, dim=0)
+
+    return {
+        'audio_input': audio_batch,
+        'mid_input': mid_list,
+    }

@@ -3,8 +3,8 @@ from guitarpro import Duration, Song
 from mido import Message, MidiFile, MidiTrack, MetaMessage
 
 
-def gp5_to_midi_simple(gp5_file, output_midi_path='output.mid',
-                       track_index=0, program=25, ticks_per_beat=480, tempo=120):
+def gp5_to_midi(gp5_file, output_midi_path='output.mid',
+                track_index=0, program=25, ticks_per_beat=480, tempo=120):
     """
     简化版GP5到MIDI转换函数，修复同一时刻音符拆分问题
 
@@ -57,8 +57,9 @@ def gp5_to_midi_simple(gp5_file, output_midi_path='output.mid',
         midi_track.append(MetaMessage('end_of_track', time=0))
 
         # 7. 保存MIDI文件
-        midi_file.save(output_midi_path)
-        print(f"转换完成: {output_midi_path}")
+        if output_midi_path is not None:
+            midi_file.save(output_midi_path)
+            print(f"转换完成: {output_midi_path}")
 
         return midi_file
 
@@ -311,8 +312,8 @@ def collect_notes_with_tie_processing(gp_track, ticks_per_beat):
 # 使用示例
 if __name__ == "__main__":
     # 转换单个音轨
-    midi_file = gp5_to_midi_simple('../model/out.gp5', '../model/out.mid', track_index=0)
-    gp5_to_midi_simple('../model/target.gp5', '../model/target.mid', track_index=0)
+    midi_file = gp5_to_midi('../model/out.gp5', '../model/out.mid', track_index=0)
+    gp5_to_midi('../model/target.gp5', '../model/target.mid', track_index=0)
     if midi_file:
         print(f"MIDI文件信息:")
         print(f"  音轨数: {len(midi_file.tracks)}")

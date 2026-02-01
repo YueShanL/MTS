@@ -11,9 +11,12 @@ from torch import Tensor
 from transformers import PreTrainedModel, EncodecModel
 
 from model.dataset import decode
+from model.loss import AutoregressiveMultiTaskLoss
 from model.mts_config import MTSGenConfig
 from model.preprocess import TemporalAdapter, NoteEmbedding, PositionalEncoding
+from model.rl.mid_comparitor import midi_to_pretty_midi, MidiVersionComparator
 from model.rl.simulator import GuitarSequenceAnalyzer, PresetConfigs
+from utils.gp2mid import gp5_to_midi
 
 
 # ============ 主模型 ============
@@ -191,6 +194,66 @@ class MTSGen(PreTrainedModel):
                 memory, generate_length, do_sample=do_sample, return_logits=return_logits
             )
 
+    def sample_logits(self, logits, temperature=1.0, top_k=5, top_p=0.9):
+        """
+           并行化的批量采样方法（如果单步采样支持并行）
+
+           Args:
+               logits: dict，包含多个时间步的输入数据
+               temperature: 温度参数
+               top_k: top-k采样参数
+               top_p: top-p采样参数
+
+           Returns:
+               dict: 采样结果
+           """
+        import torch
+
+        batch_size, seq_len = None, None
+
+        # 获取形状信息
+        for key, value in logits.items():
+            if batch_size is None and len(value.shape) >= 2:
+                batch_size = value.shape[0]
+                seq_len = value.shape[1]
+            break
+
+        if batch_size is None or seq_len is None:
+            raise ValueError("无法从data_dict中获取batch大小和序列长度")
+
+        # 重组数据以便并行处理
+        # 将 [B, T, ...] 转换为 [B*T, ...]
+        flat_data = {}
+        for key, value in logits.items():
+            if len(value.shape) >= 3:
+                # 展平batch和时间维度
+                flat_shape = (-1,) + value.shape[2:]
+                flat_data[key] = value.reshape(flat_shape)
+            else:
+                # 对于没有时间维度的数据，扩展以匹配batch*time
+                flat_data[key] = value.unsqueeze(1).expand(-1, seq_len, *value.shape[1:]).reshape(
+                    -1, *value.shape[1:]
+                )
+
+        # 批量采样
+        flat_results = self._sample_next_note(flat_data, temperature=temperature, top_k=top_k, top_p=top_p)
+
+        # 恢复原始形状 [B, T, ...]
+        results = {}
+        for key, value in flat_results.items():
+            if isinstance(value, torch.Tensor):
+                # 恢复batch和时间维度
+                original_shape = (batch_size, seq_len) + value.shape[1:]
+                results[key] = value.reshape(original_shape)
+            else:
+                # 对于非tensor，重新组织为batch和time维度
+                batch_results = []
+                for b in range(batch_size):
+                    time_results = value[b * seq_len:(b + 1) * seq_len]
+                    batch_results.append(time_results)
+                results[key] = batch_results
+
+        return results
 
     def _teacher_force_forward(
         self,
@@ -293,86 +356,6 @@ class MTSGen(PreTrainedModel):
             return predictions, logits
         else:
             return predictions
-    '''def _autoregressive_generate(
-        self, 
-        memory: torch.Tensor, 
-        generate_length: int,
-        do_sample: bool = True,
-        return_logits: bool = False  # 新增参数，控制是否返回logits
-    ) -> Union[Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]]:
-        """
-        自回归生成方法，可选返回logits
-        
-        Args:
-            memory: 编码后的音频特征 [B, T, D]
-            generate_length: 生成序列长度
-            do_sample: 是否使用采样
-            return_logits: 是否返回logits（为True时返回(predictions, logits)元组）
-        
-        Returns:
-            如果return_logits=False: 返回预测字典 {'duration': [B, L], 'fret': [B, L, S], ...}
-            如果return_logits=True: 返回元组 (predictions, logits)
-        """
-
-        batch_size = memory.shape[0]
-        device = memory.device
-        
-        # 初始化序列
-        current_input = self.start_token.expand(batch_size, 1, -1).to(device)
-        current_input = current_input + self.positional_encoding(
-            torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        )
-
-
-        # 存储结果
-        all_predictions = {'duration': [], 'fret': [], 'technique': []}
-        all_logits = {'duration': [], 'fret': [], 'technique': []} if return_logits else None
-        
-        # 生成循环
-        for step in range(generate_length):
-            # 解码当前步
-            seq_len = current_input.shape[1]
-            tgt_mask = self._generate_square_subsequent_mask(seq_len).to(device)
-
-            
-            decoder_output = self.autoregressive_decoder(current_input, memory, tgt_mask)
-
-
-            last_output = decoder_output[:, -1:, :]
-            #last_output = self.output_norm(last_output)
-            
-            # 计算logits
-            step_logits = self._compute_outputs(last_output)
-            
-            # 存储logits（如果需要）
-            if return_logits:
-                for key in step_logits:
-                    if key in all_logits:
-                        all_logits[key].append(step_logits[key])
-            
-            # 采样预测
-            step_predictions = self._sample_next_note(step_logits, do_sample=do_sample)
-            
-            # 存储预测
-            for key in step_predictions:
-                if key in all_predictions:
-                    all_predictions[key].append(step_predictions[key])
-            
-            # 准备下一步输入
-            next_embedding = self.note_embedding(step_predictions)
-            next_embedding = next_embedding + self.positional_encoding(
-                torch.full((batch_size, 1, 1), seq_len, dtype=torch.long, device=device)
-            )
-            current_input = torch.cat([current_input, next_embedding], dim=1)
-        
-        # 合并结果
-        predictions = {k: torch.cat(v, dim=1) for k, v in all_predictions.items()}
-        
-        if return_logits:
-            logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items()}
-            return predictions, logits
-        else:
-            return predictions'''
 
     def _compute_outputs(self, hidden_states: torch.Tensor) -> Dict[str, torch.Tensor]:
         """计算各输出头"""
@@ -415,7 +398,7 @@ class MTSGen(PreTrainedModel):
         if 'duration' in outputs:
             duration_logits = outputs['duration'] / max(temperature, 1e-8)
 
-            if do_sample:
+            if do_sample or temperature > 0.0:
                 # 应用top-k过滤
                 if top_k > 0:
                     values, indices = torch.topk(duration_logits, min(top_k, duration_logits.shape[-1]), dim=-1)
@@ -595,7 +578,7 @@ def main():
 
     # 创建模型
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'best_model_300m_epoch33.pth'))
+    model.load_state_dict(torch.load(f'checkpoint_epoch19.pth'))
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -678,8 +661,8 @@ def main():
     song = decode(sample)
     target = decode(dummy_target)
 
-    mid1 = midi_to_pretty_midi(gp5_to_midi_simple(song, output_midi_path='out.mid'))
-    mid2 = midi_to_pretty_midi(gp5_to_midi_simple(target, output_midi_path='target.mid'))
+    mid1 = midi_to_pretty_midi(gp5_to_midi(song, output_midi_path='out.mid'))
+    mid2 = midi_to_pretty_midi(gp5_to_midi(target, output_midi_path='target.mid'))
 
     comparator = MidiVersionComparator(
         time_resolution=0.1,
@@ -703,10 +686,10 @@ def main():
 
     print('out hardness')
     print('='*60)
-    analysis(sample['fret'].tolist())
+    analysis(sample)
     print('='*60)
     print('target hardness')
-    analysis(dummy_target['fret'].tolist())
+    analysis(dummy_target)
 
     gp.write(song, 'out.gp5')
     gp.write(target, 'target.gp5')
