@@ -79,41 +79,8 @@ class AutoregressiveMultiTaskLoss(nn.Module):
 
         print(f"Duration权重设置: 休止符(0)->{dur_weights[0]:.2f}, 1->{dur_weights[1]:.2f}, ...")
 
-        # ============ Fret权重 ============
-        # 你的数据：fret 25(不演奏)占77.4%，真实品位(0-24)共占22.6%
-        # 策略：极度惩罚"不演奏"，大幅提升真实品位权重
         self.fret_alpha = torch.ones(self.config.max_fret + 2).to(self.device)
 
-        # 不演奏标记(fret 25)极度惩罚
-        self.fret_alpha[-1] = 0.2  # 77.4% -> 权重0.08
-
-        # 真实品位权重策略：
-        # 1. 常用低把位(0-12)：中等奖励（频率相对较高）
-        # 2. 高把位(13-24)：高额奖励（更稀有）
-
-        # 常用低把位(0-12)：权重1.5-2.5
-        for i in range(0, 13):
-            if i == 0:  # 空弦
-                self.fret_alpha[i] = 2.0
-            elif i in [5, 7, 12]:  # 常用品位
-                self.fret_alpha[i] = 1.5
-            else:
-                self.fret_alpha[i] = 2.0
-
-        # 高把位(13-24)：更高的奖励（更稀有）
-        for i in range(13, 25):
-            if i == 23:  # 你的数据显示23品有3.9%，相对较高
-                self.fret_alpha[i] = 1.0
-            else:
-                self.fret_alpha[i] = 3.0  # 其他高把位给高奖励
-
-        # 特殊：根据你的实际数据调整某些品位的权重
-        # 例如，你的数据显示fret 23有3.9%，已经做了处理
-
-        print(f"Fret权重设置: 不演奏(25)->{self.fret_alpha[-1]:.2f}, 空弦(0)->{self.fret_alpha[0]:.2f}, 高把位(20)->{self.fret_alpha[20]:.2f}")
-
-        # ============ Technique权重 ============
-        # 暂时保持均匀，可根据实际分布调整
         self.technique_alpha = torch.ones(self.config.num_techniques).to(self.device)
 
     def _init_focal_losses(self):
