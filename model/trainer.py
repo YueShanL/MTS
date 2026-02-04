@@ -278,7 +278,7 @@ class SamplingScheduler:
     """混合训练的概率调度器"""
 
     SCHEDULES = {
-        'teacher_forced': 1,
+        'teacher_forced': lambda p, e, E: 1,
         'linear': lambda p, e, E: max(p.min_prob, 1.0 - e / E),
         'exponential': lambda p, e, E: max(p.min_prob, p.decay_rate ** e),
         'step': lambda p, e, E: {
@@ -358,7 +358,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
     # 初始化组件
     config = model.config
 
-    loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=True)
+    loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=False)
     trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size + 1,scheduler_type= scheduler_type)
 
     # 创建数据加载器
