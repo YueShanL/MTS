@@ -1,3 +1,5 @@
+import logging
+
 import torch
 
 from data.loader import load_piast_dataset
@@ -25,7 +27,7 @@ if __name__ == "__main__":
     )
 
     training_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['train'],
+        midi_dataset=train_val_split['train'].select(range(2)),
         batch=16,
         length_seconds=8,
         sample_rate=24000,
@@ -36,7 +38,7 @@ if __name__ == "__main__":
         random_start=True
     )
     eval_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['test'],
+        midi_dataset=train_val_split['test'].select(range(1)),
         batch=16,
         length_seconds=8,
         sample_rate=24000,
@@ -57,6 +59,9 @@ if __name__ == "__main__":
 
     trainer_config = TestRLConfig()
     trainer_config.save_dir = "../output/Model/rl_training_results"
+    trainer_config.num_epochs = 300
+    trainer_config.log_interval = 20
+    trainer_config.save_interval = 30
 
     trainer = RLTrainer(
         model=model,
@@ -64,6 +69,7 @@ if __name__ == "__main__":
         similarity_system=MidiVersionComparator(),
         config=trainer_config,
     )
+    trainer.logger.setLevel(logging.DEBUG)
     #trainer.load_checkpoint("")
 
     # 开始训练

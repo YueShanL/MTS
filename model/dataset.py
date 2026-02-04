@@ -1,6 +1,8 @@
+import random
 from pathlib import Path
 from typing import List, Dict, Optional, Generator
 
+import librosa
 import numpy as np
 import torch
 from guitarpro import Song, NoteEffect, Duration, Beat
@@ -24,7 +26,8 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
                  sliding_window: int = 10,
                  segment: int = 16,
                  context_len = 8,
-                 max_len:int = 200):
+                 max_len:int = 200,
+                 data_enhance = False):
         self.context_len = context_len
         self.cumulative_slices = None
         self.slice_counts = None
@@ -38,6 +41,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         self.bpm = bpm
         self.max_len = max_len
         self.dataset_len = max_len
+        self.data_enhance = data_enhance
 
         # 验证数据
         assert len(audio_inputs) == len(tab_data), "音频和标签数量不匹配"
@@ -45,7 +49,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         self.init_cumulative_slices()
 
     def __len__(self):
-        return self.cumulative_slices[-1]
+        return (self.cumulative_slices[-1] * 3) if self.data_enhance else self.cumulative_slices[-1]
 
     def __getitem__(self, idx):
         if len(self.slice_counts) == 0 and len(self.audio_inputs) != 0:
@@ -53,6 +57,10 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
 
         import bisect
         # 找到第一个 >= idx 的位置，然后减1得到 data_idx
+        sub = 0
+        if self.data_enhance:
+            idx = idx // 3
+            sub = idx % 3
         data_idx = bisect.bisect_right(self.cumulative_slices, idx) - 1
         slice_idx = idx - self.cumulative_slices[data_idx]
 
@@ -86,11 +94,174 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
             # 使用torch.nn.functional.pad，更高效且与后续流程兼容
             input_audio = functional.pad(input_audio, (0, pad_length), mode='constant', value=0)
 
-        return {
+        result = {
             'audio_input': input_audio,
             'context_notes': context_data,
             'target_notes': tab_data
         }
+        return self.enhance_data(sub, result)
+
+    def enhance_data(self, idx, data):
+        if idx == 1:
+            semitones = random.choice([1, 2, 3, 4])
+            data['context_notes'] = self.transpose_guitar_tab(data['context_notes'], semitones)
+            data['target_notes'] = self.transpose_guitar_tab(data['target_notes'], semitones)
+            data['audio_input'] = self.transpose_waveform(data['audio_input'], semitones, self.sample_rate)
+        elif idx == 2:
+            semitones = random.choice([-1, -2, -3, -4])
+            data['context_notes'] = self.transpose_guitar_tab(data['context_notes'], semitones)
+            data['target_notes'] = self.transpose_guitar_tab(data['target_notes'], semitones)
+            data['audio_input'] = self.transpose_waveform(data['audio_input'], semitones, self.sample_rate)
+        return data
+
+    @staticmethod
+    def transpose_waveform(waveform, semitones, sample_rate=24000):
+        """
+        使用librosa进行高质量的音频变调
+
+        参数:
+        - waveform: 音频波形，形状为 [batch, samples]
+        - semitones: 变调半音数
+        - sample_rate: 采样率
+
+        返回:
+        - 变调后的波形
+        """
+        batch_size, num_samples = waveform.shape
+        transposed = torch.zeros_like(waveform)
+
+        for b in range(batch_size):
+            # 转换为numpy数组
+            audio_np = waveform[b].cpu().numpy()
+
+            # 使用librosa进行变调
+            # 注意：librosa的pitch_shift返回的音频长度可能不同
+            shifted = librosa.effects.pitch_shift(
+                audio_np,
+                sr=sample_rate,
+                n_steps=semitones,
+                bins_per_octave=12
+            )
+
+            # 确保长度匹配
+            if len(shifted) > num_samples:
+                shifted = shifted[:num_samples]
+            elif len(shifted) < num_samples:
+                # 填充
+                padded = np.zeros(num_samples)
+                padded[:len(shifted)] = shifted
+                shifted = padded
+
+            transposed[b] = torch.from_numpy(shifted).to(waveform.device)
+
+
+        return transposed.to(waveform.device)
+
+    @staticmethod
+    def transpose_guitar_tab(data, semitones, max_fret=24):
+        """
+        向量化实现的直接法吉他变调（更高效）
+
+        参数:
+        - data: 输入数据
+        - semitones: 变调半音数
+        - max_fret: 最大品位
+
+        返回:
+        - 变调后的数据
+        """
+        # 复制数据
+        result = {
+            'duration': data['duration'].clone(),
+            'fret': data['fret'].clone(),
+            'technique': data['technique'].clone()
+        }
+
+        fret_tensor = result['fret']
+        technique_tensor = result['technique']
+        batch_size, target_length, num_strings = fret_tensor.shape
+
+        # 1. 直接加减半音
+        new_frets = fret_tensor + semitones
+
+        # 2. 找出违规位置
+        invalid_mask = (new_frets < 0) | (new_frets > max_fret)
+
+        # 3. 创建合法的变调结果（先不处理违规位置）
+        result['fret'] = new_frets
+
+        # 4. 为每个违规位置尝试移动弦
+        # 定义弦间音程差矩阵 [6, 6]，表示从弦i移动到弦j需要的半音调整
+        # 正值表示需要增加的半音数，负值表示需要减少的半音数
+        interval_matrix = torch.zeros((6, 6), device=fret_tensor.device)
+
+        # 标准调弦：E(0) A(5) D(10) G(15) B(19) E(24)
+        standard_tuning = torch.tensor([0, 5, 10, 15, 19, 24], device=fret_tensor.device)
+
+        # 计算任意两根弦之间的音程差
+        for i in range(6):
+            for j in range(6):
+                interval_matrix[i, j] = standard_tuning[j] - standard_tuning[i]
+
+        # 5. 处理每个批次和时间步
+        for b in range(batch_size):
+            for t in range(target_length):
+                # 获取当前位置的所有音符
+                current_frets = new_frets[b, t].clone()
+                current_tech = technique_tensor[b, t].clone()
+
+                # 找出违规位置
+                invalid_positions = invalid_mask[b, t]
+
+                if invalid_positions.any():
+                    # 对每个违规位置尝试修复
+                    for s in torch.where(invalid_positions)[0]:
+                        original_fret = fret_tensor[b, t, s]  # 原始品位
+
+                        if original_fret == 0:  # 空弦，跳过
+                            continue
+
+                        # 尝试移动到其他弦
+                        best_move = None
+                        best_fret = None
+
+                        # 检查所有其他弦
+                        for other_s in range(6):
+                            if other_s == s:
+                                continue
+
+                            # 计算在新弦上的品位
+                            # 新品位 = 原始品位 + 变调 + 弦间音程差
+                            interval = interval_matrix[s, other_s]
+                            new_fret_on_other = original_fret + semitones + interval
+
+                            # 检查是否合法
+                            if 0 <= new_fret_on_other <= max_fret:
+                                # 检查目标弦是否空闲或可替换
+                                target_fret = current_frets[other_s]
+
+                                if target_fret == 0 or (invalid_mask[b, t, other_s] and original_fret > 0):
+                                    # 这是一个可行的移动
+                                    if best_move is None or abs(other_s - s) < abs(best_move - s):
+                                        # 选择最近的一根弦
+                                        best_move = other_s
+                                        best_fret = int(new_fret_on_other)
+
+                        # 如果找到合适的移动
+                        if best_move is not None:
+                            # 执行移动
+                            result['fret'][b, t, best_move] = best_fret
+                            result['technique'][b, t, best_move] = technique_tensor[b, t, s]
+                            result['fret'][b, t, s] = 0
+                        else:
+                            # 没有合适的移动，裁剪到合法范围
+                            clamped = max(0, min(max_fret, original_fret + semitones))
+                            result['fret'][b, t, s] = int(clamped)
+
+        # 6. 最终确保所有值合法
+        result['fret'] = torch.clamp(result['fret'], min=0, max=max_fret).long()
+
+        return result
 
     def slide_data(self, audio, tab, type = "pt"):
         audio_length = len(audio)

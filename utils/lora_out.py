@@ -27,14 +27,14 @@ if __name__ == "__main__":
                                                                    torch_dtype=torch.float16).to(device)
 
     # Load LoRA adapter
-    model = PeftModel.from_pretrained(model, "../output/Lora/adaptor/checkpoint-epoch-10").to(device)
+    model = PeftModel.from_pretrained(model, "../output/Lora/adaptor/musicgen_lora_piano_large_dataset").to(device)
 
     processor = AutoProcessor.from_pretrained("facebook/musicgen-melody")  # config.base_model_name_or_path)
 
     inputs = processor(
         audio = wav.squeeze()[:5*32000],
         sampling_rate = sample_rate,
-        text=["piano cover"],#, "80s blues track with groovy saxophone"],
+        text=["piano cover"],
         padding=True,
         return_tensors="pt",
     ).to(device)

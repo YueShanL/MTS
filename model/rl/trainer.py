@@ -11,6 +11,7 @@ import guitarpro as gp
 
 import numpy as np
 import torch
+from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
 
 from model.dataset import decode
@@ -36,7 +37,7 @@ class RLConfig:
     generate_length: int = 64
     initial_temp: float = 0.6
     min_temp: float = 0.1
-    temp_decay: float = 1 - 1e4
+    temp_decay: float = 1 - 1e-4
     exploration_temp_factor: float = 5.0  # 探索温度倍数
 
     # 经验回放与探索
@@ -66,7 +67,7 @@ class RLConfig:
     dataset_limit: int = None
 
     def difficulty_fn(self, param):
-        return 10/(param + 10)
+        return (1.0 - torch.sigmoid(torch.tensor(param - 5.0))).float()
 
     def similarity_fn(self, param):
         return param
@@ -89,11 +90,11 @@ class TestRLConfig(RLConfig):
     """测试配置"""
     def __init__(self):
         super().__init__(**self.to_dict())
-        self.num_epochs: int = 10
+        self.num_epochs: int = 100
         self.batch_size: int = 1
         self.num_workers: int = 1
 
-        self.replay_buffer_size: int = 10
+        self.replay_buffer_size: int = 1000
         self.exploration_interval: int = 5
 
         self.dataset_limit = 10
@@ -131,9 +132,7 @@ class RLTrainer:
         self.output_weights = {
             'fret': 1.0,
             'technique': 0.5,
-            'duration': 0.3,
-            'velocity': 0.2,
-            'string': 0.2
+            'duration': 1,
         }
 
         # 日志
@@ -148,48 +147,46 @@ class RLTrainer:
         buffer_list = list(self.replay_buffer)
         batch_experiences = random.sample(buffer_list, min(batch_size, len(buffer_list)))
 
-        # 准备输入数据
+        # 准备输入数据和logits
         audio_inputs = []
         sequences = []
         rewards_list = []
+        behavior_logits_list = []  # 存储行为策略logits
+        temperatures_list = []  # 存储采样温度
 
         for exp in batch_experiences:
             audio_inputs.append(exp["audio_features"])
             sequences.append(exp["sequence"])
             rewards_list.append(exp["rewards"]["total"])
+            behavior_logits_list.append(exp.get("behavior_logits", {}))
+            temperatures_list.append(exp.get("temperature", self.temperature))
 
         # 转换为张量
         audio_tensor = torch.stack(audio_inputs).to(self.device)
         rewards_tensor = torch.tensor(rewards_list, dtype=torch.float32).to(self.device)
+        temperatures_tensor = torch.tensor(temperatures_list, dtype=torch.float16).to(self.device)
 
-        # 2. 准备Teacher Forcing输入（使用经验中的序列作为目标）
-        tf_inputs = self._prepare_teacher_forcing_inputs(sequences)
+        # 2. 准备输入（使用经验中的序列作为目标）
+        old_sequence = self._stack_dict_list(sequences)
+        behavior_output = self._stack_dict_list(behavior_logits_list)
 
-        # 3. Teacher Forcing前向传播 - 获取logits（行为策略）
         self.model.train()
         self.optimizer.zero_grad()
 
-        # 行为策略（旧的，用于采样）
-        with torch.no_grad():
-            behavior_output = self.model(
-                audio_tensor,
-                teacher_forcing=True,
-                target_notes=tf_inputs,  # 使用经验中的序列
-            )
-
-        # 4. 从行为策略采样
-        sampled_actions = self.model._sample_next_note(behavior_output, self.temperature)
-
         # 5. 计算行为策略的对数概率
-        behavior_log_probs = self._compute_log_probs_dict(behavior_output, sampled_actions)
+        behavior_log_probs = self._compute_log_probs_dict(behavior_output, old_sequence, temperatures_tensor)
 
         # 6. 计算目标策略（当前模型）的对数概率
-        target_output = self.model(
+        new_output, new_logits = self.model(
             audio_tensor,
-            teacher_forcing=True,
-            target_notes=sampled_actions,  # 使用采样得到的动作
+            generate_length=self.config.generate_length,
+            do_sample=True,
+            return_logits=True,
+            temperature=self.temperature,
+            #teacher_forcing=True,
+            #target_notes=sampled_actions,  # 使用采样得到的动作
         )
-        target_log_probs = self._compute_log_probs_dict(target_output, sampled_actions)
+        target_log_probs = self._compute_log_probs_dict(new_logits, new_output, self.temperature)
 
         # 7. 计算重要性采样比率（用于Off-policy）
         log_ratios = {}
@@ -223,7 +220,7 @@ class RLTrainer:
                 total_loss += weight * policy_loss
 
         # 10. 添加熵正则化
-        entropy_loss = self._compute_entropy_dict(target_output)
+        entropy_loss = self._compute_entropy_dict(new_logits)
         entropy_coef = 0.01
         total_loss -= entropy_coef * entropy_loss
 
@@ -233,7 +230,7 @@ class RLTrainer:
         self.optimizer.step()
 
         # 12. 评估新策略并更新经验池
-        self._evaluate_and_update_buffer(audio_tensor, sampled_actions, rewards_tensor, batch_experiences)
+        self._evaluate_and_update_buffer(audio_tensor, new_logits, batch_experiences)
 
         # 13. 更新状态
         self.loss_history.append(total_loss.item())
@@ -258,7 +255,7 @@ class RLTrainer:
 
         return stats
 
-    def _prepare_teacher_forcing_inputs(self, sequences: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    def _stack_dict_list(self, sequences: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         """准备Teacher Forcing输入（多头版本）"""
         # 收集所有可能的关键字
         all_keys = set()
@@ -286,9 +283,10 @@ class RLTrainer:
         return result
 
     def _compute_log_probs_dict(self, logits_dict: Dict[str, torch.Tensor],
-                                actions: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+                                actions: Dict[str, torch.Tensor], temperature = None) -> Dict[str, torch.Tensor]:
         """计算字典形式logits的对数概率 - 确保梯度"""
         log_probs = {}
+        temp = 1.0 if temperature is None else temperature
 
         for key, logits in logits_dict.items():
             action_key = key
@@ -300,7 +298,7 @@ class RLTrainer:
                 logits = logits.requires_grad_(True)
 
             # 计算对数概率
-            log_probs_tensor = torch.log_softmax(logits, dim=-1)
+            log_probs_tensor = torch.log_softmax(logits / temp, dim=-1)
 
             # 收集动作对应的对数概率
             if logits.dim() == 4 and action.dim() == 3:
@@ -346,19 +344,22 @@ class RLTrainer:
             return total_entropy
 
     def _evaluate_and_update_buffer(self, audio_tensor: torch.Tensor,
-                                    sampled_actions: Dict[str, torch.Tensor],
-                                    rewards_tensor: torch.Tensor,
+                                    logits: Dict[str, torch.Tensor],
                                     old_experiences: List[Dict[str, Any]]):
         """评估新策略并更新经验池"""
         with torch.no_grad():
             self.model.eval()
 
             batch_size = audio_tensor.shape[0]
+            sequence = self.model._sample_next_note(logits, self.temperature, do_sample=True)
             for i in range(batch_size):
                 # 构建序列字典
                 seq_dict = {}
-                for key, tensor in sampled_actions.items():
+                for key, tensor in sequence.items():
                     seq_dict[key] = tensor[i].cpu()
+                logits_dict = {}
+                for key, tensor in logits.items():
+                    logits_dict[key] = tensor[i].cpu()
 
                 # 计算新奖励
                 target_midi = old_experiences[i].get("target_midi")
@@ -370,6 +371,7 @@ class RLTrainer:
                 improvement_threshold = 0.05  # 至少提升5%
                 if new_reward > old_reward * (1 + improvement_threshold):
                     self.logger.debug(f'update data with rewards: {new_rewards}')
+
                     experience = {
                         "sequence": seq_dict,
                         "rewards": new_rewards,
@@ -378,6 +380,7 @@ class RLTrainer:
                         "step": self.step_count,
                         "source": "policy_update",
                         "temperature": self.temperature,
+                        "behavior_logits": logits_dict,  # 存储新策略的logits
                         "improvement": new_reward - old_reward
                     }
 
@@ -404,17 +407,23 @@ class RLTrainer:
             if use_exploration_temp: self.logger.debug(f'current exploration temp: {current_temp}')
 
             # 生成序列
-            generated_output = self.model(
+            generated_output, logits_dict = self.model(
                 audio_input,
                 teacher_forcing=False,
                 generate_length=self.config.generate_length,
                 temperature=current_temp,
                 do_sample=True,
-                return_logits=False
+                return_logits=True
             )
 
             # 处理多头输出
             sequences = self._process_multihead_output(generated_output, batch_size)
+
+            # 处理logits字典
+            behavior_logits_dict = {}
+            for key, logits in logits_dict.items():
+                behavior_logits_dict[key] = logits.cpu()  # 存储到CPU
+
 
             # 评估并存储经验
             for i in range(batch_size):
@@ -424,9 +433,8 @@ class RLTrainer:
                 # 计算奖励
                 rewards = self.calculate_reward(seq, target_midi)
 
-                # 准备序列数据（确保是字典格式）
+                # 准备序列数据
                 if not isinstance(seq, dict):
-                    # 如果是张量，假设是fret序列
                     seq_dict = {
                         'fret': seq,
                         'technique': torch.zeros_like(seq),
@@ -435,7 +443,16 @@ class RLTrainer:
                 else:
                     seq_dict = seq
 
-                # 创建经验
+                # 提取该样本的logits
+                sample_logits = {}
+                for key, logits_tensor in behavior_logits_dict.items():
+                    if logits_tensor.dim() > 0 and logits_tensor.shape[0] == batch_size:
+                        sample_logits[key] = logits_tensor[i].clone()
+                    else:
+                        # 如果没有batch维度，直接使用
+                        sample_logits[key] = logits_tensor.clone()
+
+                # 创建经验（包含logits）
                 experience = {
                     "sequence": seq_dict,
                     "rewards": rewards,
@@ -443,6 +460,7 @@ class RLTrainer:
                     "target_midi": target_midi,
                     "step": self.step_count,
                     "temperature": current_temp,
+                    "behavior_logits": sample_logits,  # 新增：存储logits
                     "source": "exploration" if use_exploration_temp else "standard"
                 }
 
@@ -729,6 +747,8 @@ class RLTrainer:
         with open(config_path, 'w') as f:
             json.dump(self.config.to_dict(), f, indent=2)
 
+        rewards = []
+
         # 训练循环
         for epoch in range(self.config.num_epochs):
             epoch_losses = []
@@ -756,9 +776,11 @@ class RLTrainer:
                             f"Epoch {epoch + 1}, Batch {batch_idx}: "
                             f"Loss: {train_stats['loss']:.4f}, "
                             f"Avg Reward: {train_stats['avg_reward']:.4f}, "
+                            f"Reward std: {train_stats['reward_std']:.4f}, "
                             f"Buffer: {train_stats['buffer_size']}, "
                             f"Temp: {self.temperature:.3f}"
                         )
+            rewards.extend(epoch_rewards)
 
             # 计算轮次统计
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
@@ -794,9 +816,11 @@ class RLTrainer:
                     "eval_stats": eval_stats if (epoch + 1) % self.config.eval_freq == 0 else None
                 })
                 if eval_stats['best_sequence'] is not None:
-                    checkpoint_dir = os.path.join(self.config.save_dir, "checkpoints")
+                    checkpoint_dir = os.path.join(self.config.save_dir, f"checkpoints_epoch{epoch + 1}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
                     gp.write(decode(eval_stats['best_sequence']), f'{checkpoint_dir}/out.gp5')
+                    _generate_loss_plot(rewards, checkpoint_dir)
+
 
         self.logger.info("训练完成")
 
@@ -861,3 +885,22 @@ def collate_fn(batch):
         'audio_input': audio_batch,
         'mid_input': mid_list,
     }
+
+def _generate_loss_plot(all_losses, output_path):
+    """生成loss图表"""
+    plt.figure(figsize=(10, 6))
+
+    # 绘制loss曲线
+    plt.plot(all_losses, 'b-', linewidth=1.5, alpha=0.8)
+
+    plt.xlabel('Training Step', fontsize=12)
+    plt.ylabel('Reward', fontsize=12)
+    plt.title('Training Reward', fontsize=14)
+    plt.grid(True, alpha=0.3)
+
+    # 保存图表
+    plot_path = os.path.join(output_path, 'reward_plot.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Loss plot saved to: {plot_path}")
