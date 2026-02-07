@@ -96,6 +96,20 @@ class MTSGenConfig(PretrainedConfig):
         self.target_temporal_resolution = target_temporal_resolution
 
     @staticmethod
+    def mtsGen_75m(): return MTSGenConfig(
+                hidden_size=512,  # 增加隐藏层维度
+                num_hidden_layers=12,  # 增加层数
+                num_attention_heads=8,  # 增加头数，1024 ÷ 16 = 64
+                intermediate_size=2048,  # 增加前馈网络维度
+                num_durations=13,
+                num_techniques=14,
+                context_bars=4,
+                predict_bars=1,
+                max_fret=24,
+                freeze_encoder=True
+            )
+    
+    @staticmethod
     def mtsGen_150m(): return MTSGenConfig(
                 hidden_size=1024,  # 增加隐藏层维度
                 num_hidden_layers=12,  # 增加层数

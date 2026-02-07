@@ -15,7 +15,7 @@ linux = 1
 debug = 0
 if __name__ == '__main__':
     dataset_path = "output/Model/dataset" if linux else "../output/Model/dataset"
-    output_path = "output/Model/tf_with_focal" if linux else "../output/Model"
+    output_path = "output/Model/tf_50m" if linux else "../output/Model"
     piast_yt = "data/dataset/PIAST/piast_yt/midi" if linux else "../data/dataset/PIAST/piast_yt/midi"
 
     generating_dataset = False
@@ -113,9 +113,9 @@ if __name__ == '__main__':
     seed=42,
     shuffle=True
     )
-    config = MTSGenConfig.mtsGen_150m()
+    config = MTSGenConfig.mtsGen_75m()
     model = MTSGen(config)
     #model.load_state_dict(torch.load(f'Scripts/final_model.pth'))
     model.to('cuda')
     train_mixed_model(model, train_val_split['train'], val_dataset=train_val_split['test'],
-                          num_epochs=100, batch_size=8, output_path=output_path, scheduler_type = "teacher_forced")
+                          num_epochs=100, batch_size=16, output_path=output_path, scheduler_type = "teacher_forced")
