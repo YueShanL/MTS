@@ -1,3 +1,4 @@
+import math
 from collections import deque
 import datetime
 import json
@@ -11,7 +12,9 @@ import guitarpro as gp
 
 import numpy as np
 import torch
+from gradio.monitoring_dashboard import total_requests
 from matplotlib import pyplot as plt
+from sympy import total_degree
 from torch.utils.data import DataLoader
 
 from model.dataset import decode
@@ -38,7 +41,7 @@ class RLConfig:
     initial_temp: float = 0.6
     min_temp: float = 0.1
     temp_decay: float = 1 - 1e-4
-    exploration_temp_factor: float = 5.0  # 探索温度倍数
+    exploration_temp_factor: float = 3.0  # 探索温度倍数
 
     # 经验回放与探索
     replay_buffer_size: int = 10000
@@ -47,7 +50,7 @@ class RLConfig:
     exploration_reward_threshold: float = 0.6  # 探索经验的最低奖励阈值
 
     # 奖励权重与函数
-    reward_weights: Dict[str, float] = field(default_factory=lambda: {"difficulty": 0.6, "similarity": 1.0})
+    reward_weights: Dict[str, float] = field(default_factory=lambda: {"difficulty": 0, "similarity": 1.0})
     complexity_weight: float = 0.1  # 复杂性奖励权重
 
     # 训练频率
@@ -70,7 +73,7 @@ class RLConfig:
         return (1.0 - torch.sigmoid(torch.tensor(param - 5.0))).float()
 
     def similarity_fn(self, param):
-        return param
+        return param - 0.5
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
@@ -94,7 +97,7 @@ class TestRLConfig(RLConfig):
         self.batch_size: int = 1
         self.num_workers: int = 1
 
-        self.replay_buffer_size: int = 1000
+        self.replay_buffer_size: int = 50
         self.exploration_interval: int = 5
 
         self.dataset_limit = 10
@@ -170,6 +173,8 @@ class RLTrainer:
         old_sequence = self._stack_dict_list(sequences)
         behavior_output = self._stack_dict_list(behavior_logits_list)
 
+        #new_output, new_logits = (old_sequence, behavior_output)
+
         self.model.train()
         self.optimizer.zero_grad()
 
@@ -177,7 +182,7 @@ class RLTrainer:
         behavior_log_probs = self._compute_log_probs_dict(behavior_output, old_sequence, temperatures_tensor)
 
         # 6. 计算目标策略（当前模型）的对数概率
-        new_output, new_logits = self.model(
+        '''new_output, new_logits = self.model(
             audio_tensor,
             generate_length=self.config.generate_length,
             do_sample=True,
@@ -186,7 +191,7 @@ class RLTrainer:
             #teacher_forcing=True,
             #target_notes=sampled_actions,  # 使用采样得到的动作
         )
-        target_log_probs = self._compute_log_probs_dict(new_logits, new_output, self.temperature)
+        target_log_probs = self._compute_log_probs_dict(new_logits, new_output, Tensor([self.temperature]))
 
         # 7. 计算重要性采样比率（用于Off-policy）
         log_ratios = {}
@@ -195,7 +200,29 @@ class RLTrainer:
                 log_ratios[key] = target_log_probs[key] - behavior_log_probs[key].detach()
 
         # 8. 计算优势函数（标准化奖励）
-        advantages = self._compute_advantages(rewards_tensor)
+        advantages = self._compute_advantages(rewards_tensor)'''
+
+        total_log_prob = torch.zeros(audio_tensor.shape[0], device=self.device)
+
+        for key, probs in behavior_log_probs.items():
+            total_log_prob += probs
+
+        # 损失 = -平均(奖励 * 对数概率)
+        # 梯度下降时，这会最大化奖励高的动作的概率
+        total_loss = -(rewards_tensor * total_log_prob).mean()
+
+        # 7. 反向传播
+        total_loss.backward()
+
+        # 非常保守的梯度裁剪
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)
+
+        # 8. 更新
+        self.optimizer.step()
+
+        '''# 9. 记录
+        avg_reward = rewards_tensor.mean().item()
+        avg_log_prob = total_log_prob.mean().item()
 
         # 9. 计算PPO风格的损失
         total_loss = torch.tensor(0.0, device=self.device)
@@ -227,10 +254,10 @@ class RLTrainer:
         # 11. 反向传播
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
-        self.optimizer.step()
+        self.optimizer.step()'''
 
         # 12. 评估新策略并更新经验池
-        self._evaluate_and_update_buffer(audio_tensor, new_logits, batch_experiences)
+        #self._evaluate_and_update_buffer(audio_tensor, new_logits, batch_experiences)
 
         # 13. 更新状态
         self.loss_history.append(total_loss.item())
@@ -244,14 +271,14 @@ class RLTrainer:
             "reward_std": rewards_tensor.std().item(),
             "buffer_size": len(self.replay_buffer),
             "temperature": self.temperature,
-            "entropy": entropy_loss.item(),
+            #"entropy": entropy_loss.item(),
         }
 
         # 添加各头的损失
-        for key, loss_val in policy_losses.items():
-            stats[f"{key}_policy_loss"] = loss_val
-        for key, loss_val in value_losses.items():
-            stats[f"{key}_value_loss"] = loss_val
+        #for key, loss_val in policy_losses.items():
+            #stats[f"{key}_policy_loss"] = loss_val
+        #for key, loss_val in value_losses.items():
+            #stats[f"{key}_value_loss"] = loss_val
 
         return stats
 
@@ -286,7 +313,8 @@ class RLTrainer:
                                 actions: Dict[str, torch.Tensor], temperature = None) -> Dict[str, torch.Tensor]:
         """计算字典形式logits的对数概率 - 确保梯度"""
         log_probs = {}
-        temp = 1.0 if temperature is None else temperature
+        temp = Tensor([1.0]) if temperature is None else temperature
+        temp = temp.to(self.device)
 
         for key, logits in logits_dict.items():
             action_key = key
@@ -298,7 +326,7 @@ class RLTrainer:
                 logits = logits.requires_grad_(True)
 
             # 计算对数概率
-            log_probs_tensor = torch.log_softmax(logits / temp, dim=-1)
+            log_probs_tensor = torch.log_softmax(logits / temp.view([temp.shape[0]] + [1] * (logits.dim() - 1)), dim=-1)
 
             # 收集动作对应的对数概率
             if logits.dim() == 4 and action.dim() == 3:
@@ -548,7 +576,8 @@ class RLTrainer:
             elif not source_has_notes and not target_has_notes:
                 similarity_reward = 1.0
             else:
-                similarity_reward = 0.0 if not source_has_notes else -100.0
+                similarity_reward = 0.0
+                if not source_has_notes: rewards["difficulty"] = math.inf
                 self.logger.warning(f'invalid midi format: expect notes > 0 but get 0 at {"source" if not source_has_notes else "target"}')
             rewards["similarity"] = float(similarity_reward)
         else:

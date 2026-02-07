@@ -27,7 +27,7 @@ if __name__ == "__main__":
     )
 
     training_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['train'].select(range(2)),
+        midi_dataset=train_val_split['train'].select(range(10)),
         batch=16,
         length_seconds=8,
         sample_rate=24000,
@@ -38,7 +38,7 @@ if __name__ == "__main__":
         random_start=True
     )
     eval_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['test'].select(range(1)),
+        midi_dataset=train_val_split['test'].select(range(3)),
         batch=16,
         length_seconds=8,
         sample_rate=24000,
@@ -52,9 +52,9 @@ if __name__ == "__main__":
     stats = training_dataset.get_stats()
     print("数据集统计:", stats)
 
-    config = MTSGenConfig.mtsGen_300m_depth()
+    config = MTSGenConfig.mtsGen_150m()
     model = MTSGen(config)
-    model.load_state_dict(torch.load(f'checkpoint_epoch19.pth'))
+    model.load_state_dict(torch.load(f'checkpoint_epoch59.pth'))
     model.to('cuda')
 
     trainer_config = TestRLConfig()
@@ -62,6 +62,8 @@ if __name__ == "__main__":
     trainer_config.num_epochs = 300
     trainer_config.log_interval = 20
     trainer_config.save_interval = 30
+    trainer_config.batch_size = 4
+    trainer_config.num_workers = 1
 
     trainer = RLTrainer(
         model=model,
