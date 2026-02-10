@@ -31,7 +31,7 @@ from utils.gp2mid import gp5_to_midi
 class RLConfig:
     """强化学习训练配置"""
     # 训练参数
-    num_epochs: int = 50
+    num_epochs: int = 200
     batch_size: int = 8
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
@@ -46,7 +46,7 @@ class RLConfig:
     # 经验回放与探索
     replay_buffer_size: int = 10000
     reward_threshold: float = 0.7
-    exploration_interval: int = 10  # 每N步进行一次高温探索
+    exploration_interval: int = 5  # 每N步进行一次高温探索
     exploration_reward_threshold: float = 0.6  # 探索经验的最低奖励阈值
 
     # 奖励权重与函数
@@ -67,7 +67,7 @@ class RLConfig:
     # 路径配置
     save_dir: str = "./rl_training_results"
 
-    dataset_limit: int = None
+    dataset_limit: int = replay_buffer_size // 2
 
     def difficulty_fn(self, param):
         return (1.0 - torch.sigmoid(torch.tensor(param - 5.0))).float()

@@ -1,56 +1,30 @@
 import logging
+import random
 
 import torch
+from datasets import load_dataset
 
-from data.loader import load_piast_dataset
 from model.mts_config import MTSGenConfig
 from model.mts_generate import MTSGen
-from model.rl.dataset import MIDISegmentDataset
+from model.rl.huggingface_dataset import IterableMIDIDataset
 from model.rl.mid_comparitor import MidiVersionComparator
 from model.rl.simulator import GuitarSequenceAnalyzer, PresetConfigs
-from model.rl.trainer import RLTrainer, RLConfig, TestRLConfig
-
-debug = 0
-continue_on_exception = 1
-linux = 0
+from model.rl.trainer import RLTrainer, TestRLConfig
 
 if __name__ == "__main__":
-    dataset = load_piast_dataset(repo_path="data/dataset/PIAST", download_if_empty=True) if linux \
-        else load_piast_dataset(repo_path="../data/dataset/PIAST", download_if_empty=True)
-
-    size = len(dataset["piast-yt"])
-
-    train_val_split = dataset["piast-yt"].select(range(size)).train_test_split(
-        test_size=0.1,
-        seed=42,
-        shuffle=True
+    seed = 43
+    train_dataset = load_dataset("astune/mts_rl_dataset", streaming=True).filter(
+        lambda x, idx: random.Random(seed + idx).random() > 0.1,
+        with_indices=True
+    )
+    val_dataset = load_dataset("astune/mts_rl_dataset", streaming=True).filter(
+        lambda x, idx: random.Random(seed + idx).random() <= 0.1,
+        with_indices=True
     )
 
-    training_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['train'].select(range(10)),
-        batch=16,
-        length_seconds=8,
-        sample_rate=24000,
-        overlap_ratio=0.3,
-        shuffle=True,
-        infinite=True,
-        min_notes_per_segment=3,
-        random_start=True
-    )
-    eval_dataset = MIDISegmentDataset(
-        midi_dataset=train_val_split['test'].select(range(3)),
-        batch=16,
-        length_seconds=8,
-        sample_rate=24000,
-        overlap_ratio=0.3,
-        shuffle=True,
-        infinite=True,
-        min_notes_per_segment=3,
-        random_start=True
-    )
+    training_dataset = IterableMIDIDataset(train_dataset['train'])
+    val_dataset = IterableMIDIDataset(val_dataset['train'])
 
-    stats = training_dataset.get_stats()
-    print("数据集统计:", stats)
 
     config = MTSGenConfig.mtsGen_150m()
     model = MTSGen(config)
@@ -63,7 +37,7 @@ if __name__ == "__main__":
     trainer_config.log_interval = 20
     trainer_config.save_interval = 30
     trainer_config.batch_size = 4
-    trainer_config.num_workers = 1
+    trainer_config.num_workers = 0
 
     trainer = RLTrainer(
         model=model,
@@ -75,7 +49,7 @@ if __name__ == "__main__":
     #trainer.load_checkpoint("")
 
     # 开始训练
-    trainer.train(train_dataset=training_dataset, val_dataset = eval_dataset)
+    trainer.train(train_dataset=training_dataset, val_dataset = val_dataset)
 
 
 

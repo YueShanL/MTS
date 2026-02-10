@@ -1,10 +1,13 @@
 import io
 import logging
+import os
 from typing import Iterator, Dict, Any, Union, List, Optional
 from dataclasses import dataclass
 import numpy as np
 import torch
 import pretty_midi
+from datasets import load_dataset, IterableDataset
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +247,7 @@ def restore_to_midi_dataset_format(
         midi_bytes = hf_sample["midi_bytes"]
         if isinstance(midi_bytes, bytes):
             try:
-                midi_obj = pretty_midi.PrettyMIDI(file_object=io.BytesIO(midi_bytes))
+                midi_obj = pretty_midi.PrettyMIDI(io.BytesIO(midi_bytes))
                 result["midi"] = midi_obj
             except Exception as e:
                 logger.error(f"解析MIDI字节失败: {e}")
@@ -287,3 +290,118 @@ def batch_restore_to_midi_dataset_format(
         )
         for sample in hf_batch
     ]
+
+class IterableMIDIDataset(torch.utils.data.IterableDataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __iter__(self):
+        return self.dataset_iterator()
+
+    def dataset_iterator(self):
+        for sample in self.dataset:
+            restored = restore_to_midi_dataset_format(sample)
+            if restored.get("audio") is not None and restored.get("midi") is not None:
+                yield restored["audio"], restored["midi"]
+
+
+def collate_fn(batch):
+    """
+    自定义collate函数，处理包含pretty_midi.PrettyMIDI对象的批次
+
+    Args:
+        batch: 包含(音频张量, MIDI对象)的列表
+
+    Returns:
+        批处理后的(音频批次, MIDI列表)
+    """
+    # 解压批次
+    if batch and len(batch[0]) == 2:
+        audio_list, midi_list = zip(*batch)
+
+        # 堆叠音频张量
+        audio_batch = torch.stack(audio_list, dim=0)
+
+        # MIDI对象保持为列表
+        midi_batch = list(midi_list)
+
+        return audio_batch, midi_batch
+    else:
+        # 如果批次为空或格式不正确，返回空值
+        return torch.empty(0), []
+
+if __name__ == "__main__":
+    import soundfile as sf
+    # 示例1: 自定义Dataset\
+
+    null_handler = logging.NullHandler()
+
+    logger = logging.getLogger()
+
+    logger.addHandler(null_handler)
+
+
+    # 创建MIDI切片数据集
+    midi_dataset = load_dataset("astune/mts_rl_dataset", streaming=True)
+
+    # 创建torch数据集
+    torch_dataset = IterableMIDIDataset(midi_dataset['train'])
+
+    # 创建数据加载器 - 对于IterableDataset，shuffle必须为False
+    dataloader = DataLoader(
+        torch_dataset,
+        batch_size=8,
+        collate_fn=collate_fn,
+        shuffle=False  # IterableDataset不支持shuffle
+    )
+
+    print("\n测试数据加载...")
+    for batch_idx, (audio_batch, midi_batch) in enumerate(dataloader):
+        print(f"批次 {batch_idx}: 音频形状: {audio_batch.shape}")
+        if batch_idx >= 1:
+            break
+    '''import logging
+
+    # 打印所有logger
+    for name in logging.Logger.manager.loggerDict:
+        print(name)'''
+
+    collected_samples = []
+
+    for batch_idx, (audio_batch, midi_batch) in enumerate(dataloader):
+        print(f"批次 {batch_idx}: 获得 {len(audio_batch)} 个样本")
+
+        # 收集样本
+        for i in range(len(audio_batch)):
+            collected_samples.append((audio_batch[i], midi_batch[i]))
+
+        if len(collected_samples) >= 2:
+            break
+
+    # 导出前5个样本
+    print(f"\n导出 {len(collected_samples)} 个样本...")
+
+    # 创建输出目录
+    output_dir = "debug_output/output_samples"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 导出每个样本的音频和MIDI
+    for i, (audio, midi) in enumerate(collected_samples):
+        # 导出音频
+        audio_path = os.path.join(output_dir, f"sample_{i}.wav")
+        audio_np = audio.numpy()
+        sf.write(audio_path, audio_np, 24000)
+
+        # 导出MIDI
+        midi_path = os.path.join(output_dir, f"sample_{i}.mid")
+        midi.write(midi_path)
+
+        print(f"样本 {i}:")
+        print(f"  音频已保存: {audio_path}")
+        print(f"  MIDI已保存: {midi_path}")
+        print(f"  音频时长: {len(audio_np) / 24000:.2f}秒")
+        print(f"  音频范围: [{audio_np.min():.3f}, {audio_np.max():.3f}]")
+        print(f"  MIDI音符数: {sum(len(instr.notes) for instr in midi.instruments)}")
+
+
+    print("\n测试完成!")
