@@ -13,8 +13,6 @@ linux = 1
 debug = 0
 token = ""
 if __name__ == '__main__':
-    dataset_path = "output/Model/dataset" if linux else "../output/Model/dataset"
-    output_path = "output/Model/tf_50m" if linux else "../output/Model"
     piast_yt = "data/dataset/PIAST/piast_yt/midi" if linux else "../data/dataset/PIAST/piast_yt/midi"
 
     iterable_dataset = IterableDataset.from_generator(
@@ -25,7 +23,6 @@ if __name__ == '__main__':
             "type": 'py'
         })
 
-    temp_dir = f"{dataset_path}_temp"
     batch_size = 10000
     batch_count = 0
     current_batch = []
