@@ -350,7 +350,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         return
 
     @classmethod
-    def generator_from_path(cls, mid_path:str, start = 0, limit = 1000, type = 'pt'):
+    def generator_from_path(cls, mid_path:str, start = 0, limit = None, type = 'pt'):
         extensions = ['.mid', '.midi', '.MID', '.MIDI']
         midi_files = []
 
@@ -366,6 +366,9 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
         dataset = AudioGuitarTabDataset(audio_inputs, tab_data)
 
         convertor = MIDItoGP5Converter(GuitarProGenerator())
+
+        limit = limit if limit is None else (len(midi_files) - start)
+
         for idx, f in enumerate(midi_files[start:start + limit]):
             if idx >= limit:
                 break
