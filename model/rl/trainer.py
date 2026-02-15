@@ -44,9 +44,9 @@ class RLConfig:
     exploration_temp_factor: float = 3.0  # 探索温度倍数
 
     # 经验回放与探索
-    replay_buffer_size: int = 10000
+    replay_buffer_size: int = 100000
     reward_threshold: float = 0.7
-    exploration_interval: int = 5  # 每N步进行一次高温探索
+    exploration_interval: int = 3  # 每N步进行一次高温探索
     exploration_reward_threshold: float = 0.6  # 探索经验的最低奖励阈值
 
     # 奖励权重与函数
@@ -144,7 +144,7 @@ class RLTrainer:
         self.logger.info(f"输出头权重: {self.output_weights}")
 
     def train_step(self, batch_size: int = 32) -> Dict[str, float]:
-        """强化学习训练步骤 - 多头输出版本"""
+        """强化学习训练步骤"""
 
         # 1. 从经验池采样
         buffer_list = list(self.replay_buffer)
@@ -197,10 +197,10 @@ class RLTrainer:
         log_ratios = {}
         for key in behavior_log_probs.keys():
             if key in target_log_probs:
-                log_ratios[key] = target_log_probs[key] - behavior_log_probs[key].detach()
+                log_ratios[key] = target_log_probs[key] - behavior_log_probs[key].detach()'''
 
         # 8. 计算优势函数（标准化奖励）
-        advantages = self._compute_advantages(rewards_tensor)'''
+        advantages = self._compute_advantages(rewards_tensor)
 
         total_log_prob = torch.zeros(audio_tensor.shape[0], device=self.device)
 
@@ -209,7 +209,7 @@ class RLTrainer:
 
         # 损失 = -平均(奖励 * 对数概率)
         # 梯度下降时，这会最大化奖励高的动作的概率
-        total_loss = -(rewards_tensor * total_log_prob).mean()
+        total_loss = -(advantages * total_log_prob).mean()
 
         # 7. 反向传播
         total_loss.backward()
@@ -777,6 +777,7 @@ class RLTrainer:
             json.dump(self.config.to_dict(), f, indent=2)
 
         rewards = []
+        losses = []
 
         # 训练循环
         for epoch in range(self.config.num_epochs):
@@ -810,6 +811,7 @@ class RLTrainer:
                             f"Temp: {self.temperature:.3f}"
                         )
             rewards.extend(epoch_rewards)
+            losses.extend(epoch_losses)
 
             # 计算轮次统计
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
@@ -848,7 +850,7 @@ class RLTrainer:
                     checkpoint_dir = os.path.join(self.config.save_dir, f"checkpoints_epoch{epoch + 1}")
                     os.makedirs(checkpoint_dir, exist_ok=True)
                     gp.write(decode(eval_stats['best_sequence']), f'{checkpoint_dir}/out.gp5')
-                    _generate_loss_plot(rewards, checkpoint_dir)
+                    _generate_loss_plot(rewards, checkpoint_dir, losses=losses)
 
 
         self.logger.info("训练完成")
@@ -915,21 +917,45 @@ def collate_fn(batch):
         'mid_input': mid_list,
     }
 
-def _generate_loss_plot(all_losses, output_path):
-    """生成loss图表"""
+def _generate_loss_plot(all_reward, output_path, losses=None, loss_label='Training Loss'):
+    """
+    生成训练奖励图表，包含原始曲线、平滑曲线和可选的验证曲线。
+
+    参数：
+        all_losses (list or np.ndarray): 训练过程中的奖励值序列。
+        output_path (str): 输出目录路径。
+        val_losses (list or np.ndarray, optional): 验证奖励值序列，若提供则绘制。
+        loss_label (str): 验证曲线的图例标签，默认'Validation Reward'。
+    """
+    import numpy as np
     plt.figure(figsize=(10, 6))
 
-    # 绘制loss曲线
-    plt.plot(all_losses, 'b-', linewidth=1.5, alpha=0.8)
+    # --- 1. 绘制原始训练奖励曲线 ---
+    plt.plot(all_reward, 'b-', linewidth=1.5, alpha=0.8, label='Training Reward')
+
+    # --- 2. 计算并绘制平滑曲线（移动平均） ---
+    def smooth_curve(data, window=10):
+        if len(data) < window:
+            return data
+        weights = np.ones(window) / window
+        return np.convolve(data, weights, mode='same')
+
+    smoothed = smooth_curve(all_reward)
+    plt.plot(smoothed, 'r-', linewidth=1.5, alpha=0.6, label='Smoothed')
+
+    # --- 3. 如果提供了验证奖励数据，则绘制 ---
+    if losses is not None:
+        plt.plot(losses, 'g-', linewidth=1.5, alpha=0.8, label=loss_label)
 
     plt.xlabel('Training Step', fontsize=12)
     plt.ylabel('Reward', fontsize=12)
     plt.title('Training Reward', fontsize=14)
     plt.grid(True, alpha=0.3)
+    #plt.legend()  # 显示图例
 
     # 保存图表
     plot_path = os.path.join(output_path, 'reward_plot.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"Loss plot saved to: {plot_path}")
+    print(f"Reward plot saved to: {plot_path}")   # 统一为Reward（原为Loss）
