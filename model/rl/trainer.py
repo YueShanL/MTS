@@ -34,7 +34,7 @@ class RLConfig:
     """强化学习训练配置"""
     # 训练参数
     num_epochs: int = 200
-    batch_size: int = 8
+    batch_size: int = 16
     learning_rate: float = 0.01
     weight_decay: float = 1e-4
 

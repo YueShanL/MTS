@@ -367,7 +367,7 @@ class AudioGuitarTabDataset(torch.utils.data.Dataset):
 
         convertor = MIDItoGP5Converter(GuitarProGenerator())
 
-        limit = limit if limit is None else (len(midi_files) - start)
+        limit = limit if limit is not None else (len(midi_files) - start)
 
         for idx, f in enumerate(midi_files[start:start + limit]):
             if idx >= limit:
