@@ -34,7 +34,6 @@ class GuitarTechnique(Enum):
 class GuitarProGenerator:
     """
     GuitarPro文件生成器
-    解决Duration对象使用问题
     """
 
     def __init__(self):

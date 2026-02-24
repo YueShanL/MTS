@@ -4,7 +4,7 @@ from mido import Message, MidiFile, MidiTrack, MetaMessage
 
 
 def gp5_to_midi(gp5_file, output_midi_path='output.mid',
-                track_index=0, program=25, ticks_per_beat=480, tempo=120):
+                track_index=0, program=25, ticks_per_beat=480, tempo=None):
     """
     简化版GP5到MIDI转换函数，修复同一时刻音符拆分问题
 
@@ -38,7 +38,7 @@ def gp5_to_midi(gp5_file, output_midi_path='output.mid',
         midi_track.append(Message('program_change', program=program, time=0))
 
         # 设置速度
-        actual_tempo = song.tempo if hasattr(song, 'tempo') else tempo
+        actual_tempo = tempo if tempo is not None else song.tempo
         from mido import bpm2tempo
         tempo_midi = bpm2tempo(actual_tempo)
         midi_track.append(MetaMessage('set_tempo', tempo=tempo_midi, time=0))

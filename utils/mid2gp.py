@@ -113,10 +113,46 @@ class MIDItoGP5Converter:
             'tracks': tracks_data
         }
 
-    def _quantize(self, notes: List[Dict], unit=duration_map[8][0]):
+    def quantize_song(self, song: Song):
+        # 默认量化单位为八分音符的 ticks 数
+        unit = self.duration_map[8][0]  # 请确保 duration_map 在作用域内或作为类属性
 
+        # 收集所有节拍（Beat）的信息
+        beats_info = []  # 每个元素为 (beat, start_time, duration_ticks)
+        for track in song.tracks:
+            for measure in track.measures:
+                for voice in measure.voices:  # 遍历所有声部
+                    for beat in voice.beats:  # 遍历每个节拍
+                        # 获取开始时间（假设 beat 有 start 属性，值为整数 ticks）
+                        start = beat.start
+                        # 获取持续时间 ticks
+                        dur_ticks = beat.duration.time
+                        beats_info.append((beat, start, dur_ticks))
+
+        if not beats_info:
+            return  # 无节拍可量化
+
+        # 构建 _quantize 所需的字典列表
+        beats_dicts = [
+            {'start_time': start / Duration.quarterTime, 'duration_ticks': dur / Duration.quarterTime}
+            for _, start, dur in beats_info
+        ]
+
+        # 调用 _quantize 进行量化（_quantize 原为处理音符，但逻辑相同）
+        quantized = self._quantize(beats_dicts, unit)
+
+        # 将量化后的值写回节拍对象
+        for (beat, _, _), qd in zip(beats_info, quantized):
+            # 更新开始时间
+            beat.start = qd['start_time'] * Duration.quarterTime
+            # 更新持续时间
+            beat.duration = self.gp_generator.ticks_to_gp_duration(qd['duration_ticks'] * Duration.quarterTime)
+
+
+
+    def _quantize(self, notes: List[Dict], unit=duration_map[8][0]):
         for note in notes:  # round to nearest 1/16 by default
-            note['duration_ticks'] = round(note['duration_ticks'] / unit, 0) * unit
+            note['duration_ticks'] = max(round(note['duration_ticks'] / unit, 0) * unit, unit)
             note['start_time'] = round(note['start_time'] / unit, 0) * unit
 
         return notes

@@ -1,3 +1,4 @@
+import copy
 import math
 from collections import deque
 import datetime
@@ -19,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from model.dataset import decode
 from model.mts_generate import MTSGen
+from model.rl.dataset import extract_segment
 from model.rl.simulator import GuitarSequenceAnalyzer
 from model.rl.mid_comparitor import MidiVersionComparator, midi_to_pretty_midi
 
@@ -33,13 +35,14 @@ class RLConfig:
     # 训练参数
     num_epochs: int = 200
     batch_size: int = 8
-    learning_rate: float = 1e-5
+    learning_rate: float = 0.01
     weight_decay: float = 1e-4
 
     # 生成与温度参数
     generate_length: int = 64
     initial_temp: float = 0.6
     min_temp: float = 0.1
+    min_explo_temp = 1.2
     temp_decay: float = 1 - 1e-4
     exploration_temp_factor: float = 3.0  # 探索温度倍数
 
@@ -59,6 +62,7 @@ class RLConfig:
     checkpoint_freq: int = 10
     log_interval: int = 10
     update_frequency: int = 1
+    sample_batch_factor = 1
 
     # 梯度裁剪与数据加载
     grad_clip: float = 1.0
@@ -97,10 +101,10 @@ class TestRLConfig(RLConfig):
         self.batch_size: int = 1
         self.num_workers: int = 1
 
-        self.replay_buffer_size: int = 50
+        self.replay_buffer_size: int = 40000
         self.exploration_interval: int = 5
 
-        self.dataset_limit = 10
+        #self.dataset_limit = 10
 
 
 class RLTrainer:
@@ -137,6 +141,10 @@ class RLTrainer:
             'technique': 0.5,
             'duration': 1,
         }
+
+        # linear baseline
+        self.baseline_coeff = None  # 线性回归系数 [w, b]
+        self.baseline_update_freq = 50  # 每50步重新拟合一次
 
         # 日志
         self.setup_logging()
@@ -215,7 +223,7 @@ class RLTrainer:
         total_loss.backward()
 
         # 非常保守的梯度裁剪
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.1)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
         # 8. 更新
         self.optimizer.step()
@@ -263,6 +271,8 @@ class RLTrainer:
         self.loss_history.append(total_loss.item())
         self.step_count += 1
         self.temperature = max(self.config.min_temp, self.temperature * self.config.temp_decay)
+        if self.step_count % self.baseline_update_freq == 0:
+            self._fit_linear_baseline()
 
         # 14. 返回统计
         stats = {
@@ -348,11 +358,15 @@ class RLTrainer:
         return log_probs
 
     def _compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """计算优势函数（标准化奖励）"""
-        if rewards.std() > 0:
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        if not self.baseline_coeff is None:
+            w, b = self.baseline_coeff
+            baseline = w * self.step_count + b
+            advantages = rewards - baseline
         else:
             advantages = rewards - rewards.mean()
+
+        if advantages.std() > 0:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages
 
     def _compute_entropy_dict(self, logits_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -417,6 +431,20 @@ class RLTrainer:
 
             self.model.train()
 
+    def _fit_linear_baseline(self):
+        """用历史奖励拟合线性基线 y = w * step + b"""
+        if len(self.reward_history) < 10:  # 数据太少时不拟合
+            return
+
+        steps = np.array(range(0, len(self.reward_history))).reshape(-1, 1)
+        rewards = np.array([k['rewards']['total'] for k in self.reward_history])
+
+        from sklearn.linear_model import LinearRegression
+        model = LinearRegression()
+        model.fit(steps, rewards)
+
+        self.baseline_coeff = (model.coef_[0], model.intercept_)
+
     def collect_experience(self, batch: Dict[str, Any]):
         """
         收集经验 - 多头输出版本
@@ -455,49 +483,53 @@ class RLTrainer:
 
             # 评估并存储经验
             for i in range(batch_size):
-                seq = sequences[i] if i < len(sequences) else sequences[0]
-                target_midi = batch['mid_input'][i] if i < len(batch['mid_input']) else None
+                for j in range(4): # generation size(64) // validation size(16)
+                    seq = copy.deepcopy(sequences[i] if i < len(sequences) else sequences[0])
+                    for k, v in seq.items():
+                        seq[k] = v[j * 16: (j + 1) * 16]
+                    target_midi = batch['mid_input'][i] if i < len(batch['mid_input']) else None
+                    target_midi = extract_segment(target_midi, j * 2, (j+1) * 2) # using 1/16, bpm=120, 16notes = 2seconds
 
-                # 计算奖励
-                rewards = self.calculate_reward(seq, target_midi)
+                    # 计算奖励
+                    rewards = self.calculate_reward(seq, target_midi)
 
-                # 准备序列数据
-                if not isinstance(seq, dict):
-                    seq_dict = {
-                        'fret': seq,
-                        'technique': torch.zeros_like(seq),
-                        'duration': torch.zeros(seq.shape[0], dtype=torch.float32)
-                    }
-                else:
-                    seq_dict = seq
-
-                # 提取该样本的logits
-                sample_logits = {}
-                for key, logits_tensor in behavior_logits_dict.items():
-                    if logits_tensor.dim() > 0 and logits_tensor.shape[0] == batch_size:
-                        sample_logits[key] = logits_tensor[i].clone()
+                    # 准备序列数据
+                    if not isinstance(seq, dict):
+                        seq_dict = {
+                            'fret': seq,
+                            'technique': torch.zeros_like(seq),
+                            'duration': torch.zeros(seq.shape[0], dtype=torch.float32)
+                        }
                     else:
-                        # 如果没有batch维度，直接使用
-                        sample_logits[key] = logits_tensor.clone()
+                        seq_dict = seq
 
-                # 创建经验（包含logits）
-                experience = {
-                    "sequence": seq_dict,
-                    "rewards": rewards,
-                    "audio_features": batch['audio_input'][i].cpu().clone(),
-                    "target_midi": target_midi,
-                    "step": self.step_count,
-                    "temperature": current_temp,
-                    "behavior_logits": sample_logits,  # 新增：存储logits
-                    "source": "exploration" if use_exploration_temp else "standard"
-                }
+                    # 提取该样本的logits
+                    sample_logits = {}
+                    for key, logits_tensor in behavior_logits_dict.items():
+                        if logits_tensor.dim() > 0 and logits_tensor.shape[0] == batch_size:
+                            sample_logits[key] = logits_tensor[i, j * 16: (j + 1) * 16].clone()
+                        else:
+                            # 如果没有batch维度，直接使用
+                            sample_logits[key] = logits_tensor[j * 16: (j + 1) * 16].clone()
 
-                # 添加到FIFO缓冲区
-                self.replay_buffer.append(experience)
+                    # 创建经验（包含logits）
+                    experience = {
+                        "sequence": seq_dict,
+                        "rewards": rewards,
+                        "audio_features": batch['audio_input'][i,:,j * 2 * 24000:(j+1) * 2 * 24000].cpu().clone(),
+                        "target_midi": target_midi,
+                        "step": self.step_count,
+                        "temperature": current_temp,
+                        "behavior_logits": sample_logits,  # 新增：存储logits
+                        "source": "exploration" if use_exploration_temp else "standard"
+                    }
 
-                # 记录高质量经验
-                if rewards["total"] > self.config.reward_threshold:
-                    self.logger.debug(f"高质量经验: 奖励={rewards['total']:.3f}, 来源={experience['source']}")
+                    # 添加到FIFO缓冲区
+                    self.replay_buffer.append(experience)
+
+                    # 记录高质量经验
+                    if rewards["total"] > self.config.reward_threshold:
+                        self.logger.debug(f"高质量经验: 奖励={rewards['total']:.3f}, 来源={experience['source']}")
 
 
         # 更新温度（退火）
@@ -506,7 +538,7 @@ class RLTrainer:
             self.temperature * self.config.temp_decay
         )
         self.exploration_temp = max(
-            self.config.min_temp * 1.5,
+            self.config.min_explo_temp,
             self.exploration_temp * self.config.temp_decay
         )
 
@@ -515,7 +547,6 @@ class RLTrainer:
     def _process_multihead_output(self, output, batch_size: int) -> List[Any]:
         """处理多头输出，返回序列列表"""
         if isinstance(output, dict):
-            # 如果是字典，提取每个样本
             sequences = []
             for i in range(batch_size):
                 sample_dict = {}
@@ -527,10 +558,6 @@ class RLTrainer:
                             sample_value = value
                     else:
                         sample_value = value
-
-                    # 去掉_logits后缀（如果是logits）
-                    if key.endswith('_logits'):
-                        key = key.replace('_logits', '')
 
                     sample_dict[key] = sample_value
                 sequences.append(sample_dict)
@@ -778,6 +805,7 @@ class RLTrainer:
 
         rewards = []
         losses = []
+        eval_stats = {}
 
         # 训练循环
         for epoch in range(self.config.num_epochs):
@@ -795,8 +823,8 @@ class RLTrainer:
                     self.collect_experience(batch)
 
                 # 训练步骤
-                if len(self.replay_buffer) >= self.config.batch_size:
-                    train_stats = self.train_step(batch_size=self.config.batch_size)
+                if len(self.replay_buffer) >= self.config.batch_size * self.config.sample_batch_factor:
+                    train_stats = self.train_step(batch_size=self.config.batch_size * self.config.sample_batch_factor)
                     epoch_losses.append(train_stats["loss"])
                     epoch_rewards.append(train_stats["avg_reward"])
 
@@ -809,6 +837,7 @@ class RLTrainer:
                             f"Reward std: {train_stats['reward_std']:.4f}, "
                             f"Buffer: {train_stats['buffer_size']}, "
                             f"Temp: {self.temperature:.3f}"
+                            f"Baseline coeff: alpha: {self.baseline_coeff[0] if self.baseline_coeff is not None else 0.0} beta: {self.baseline_coeff[1] if self.baseline_coeff is not None else 0.0}"
                         )
             rewards.extend(epoch_rewards)
             losses.extend(epoch_losses)
@@ -846,11 +875,11 @@ class RLTrainer:
                     "avg_reward": avg_epoch_reward,
                     "eval_stats": eval_stats if (epoch + 1) % self.config.eval_freq == 0 else None
                 })
-                if eval_stats['best_sequence'] is not None:
-                    checkpoint_dir = os.path.join(self.config.save_dir, f"checkpoints_epoch{epoch + 1}")
-                    os.makedirs(checkpoint_dir, exist_ok=True)
+                checkpoint_dir = os.path.join(self.config.save_dir, f"checkpoints_epoch{epoch + 1}")
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                _generate_loss_plot(rewards, checkpoint_dir, losses=losses)
+                if eval_stats.get('best_sequence') is not None:
                     gp.write(decode(eval_stats['best_sequence']), f'{checkpoint_dir}/out.gp5')
-                    _generate_loss_plot(rewards, checkpoint_dir, losses=losses)
 
 
         self.logger.info("训练完成")

@@ -19,7 +19,6 @@ from model.rl.simulator import GuitarSequenceAnalyzer, PresetConfigs
 from utils.gp2mid import gp5_to_midi
 
 
-# ============ 主模型 ============
 class MTSGen(PreTrainedModel):
 
     config_class = MTSGenConfig
@@ -568,7 +567,6 @@ class MixedTrainingForward:
         predictions = {k: torch.cat(v, dim=1) for k, v in all_outputs.items() if v}
         logits = {k: torch.cat(v, dim=1) for k, v in all_logits.items() if v}
         return {'predictions': predictions, 'logits': logits}
-
 
 
 # ============ 测试代码 ============

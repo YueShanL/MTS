@@ -116,45 +116,6 @@ class MIDISegmentDataset(IterableDataset):
                     note_count += 1
         return note_count
 
-    def _extract_segment(self, midi: pretty_midi.PrettyMIDI,
-                         start_time: float, end_time: float) -> pretty_midi.PrettyMIDI:
-        """提取MIDI片段"""
-        segment_midi = pretty_midi.PrettyMIDI()
-
-        # 复制元数据
-        segment_midi.key_signature_changes = midi.key_signature_changes
-        segment_midi.time_signature_changes = midi.time_signature_changes
-
-        # 提取每个乐器的音符
-        for instrument in midi.instruments:
-            new_instrument = pretty_midi.Instrument(
-                program=instrument.program,
-                is_drum=instrument.is_drum,
-                name=instrument.name
-            )
-
-            for note in instrument.notes:
-                # 检查音符是否在时间段内
-                note_start = note.start
-                note_end = note.end
-
-                overlap_start = max(note_start, start_time)
-                overlap_end = min(note_end, end_time)
-
-                if overlap_start < overlap_end:
-                    new_note = pretty_midi.Note(
-                        velocity=note.velocity,
-                        pitch=note.pitch,
-                        start=overlap_start - start_time,
-                        end=overlap_end - start_time
-                    )
-                    new_instrument.notes.append(new_note)
-
-            if new_instrument.notes:
-                segment_midi.instruments.append(new_instrument)
-
-        return segment_midi
-
     def _generate_all_segments_for_file(self, sample_idx: int) -> Iterator[Tuple[torch.Tensor, pretty_midi.PrettyMIDI]]:
         """
         为指定样本生成所有片段
@@ -187,7 +148,7 @@ class MIDISegmentDataset(IterableDataset):
                 # 检查是否有足够音符
                 if self._count_notes_in_segment(midi, start_time, end_time) >= self.min_notes_per_segment:
                     # 提取MIDI片段，确保长度为指定长度
-                    segment_midi = self._extract_segment(midi, start_time, end_time)
+                    segment_midi = extract_segment(midi, start_time, end_time)
 
                     # 合成音频
                     audio, _ = midi_to_audio_tensor(segment_midi, sr = self.sample_rate, duration=self.length_seconds)
@@ -315,7 +276,44 @@ class MIDISegmentDataset(IterableDataset):
             "step_seconds": self.step_seconds
         }
 
+def extract_segment(midi: pretty_midi.PrettyMIDI,
+                    start_time: float, end_time: float) -> pretty_midi.PrettyMIDI:
+    """提取MIDI片段"""
+    segment_midi = pretty_midi.PrettyMIDI()
 
+    # 复制元数据
+    segment_midi.key_signature_changes = midi.key_signature_changes
+    segment_midi.time_signature_changes = midi.time_signature_changes
+
+    # 提取每个乐器的音符
+    for instrument in midi.instruments:
+        new_instrument = pretty_midi.Instrument(
+            program=instrument.program,
+            is_drum=instrument.is_drum,
+            name=instrument.name
+        )
+
+        for note in instrument.notes:
+            # 检查音符是否在时间段内
+            note_start = note.start
+            note_end = note.end
+
+            overlap_start = max(note_start, start_time)
+            overlap_end = min(note_end, end_time)
+
+            if overlap_start < overlap_end:
+                new_note = pretty_midi.Note(
+                    velocity=note.velocity,
+                    pitch=note.pitch,
+                    start=overlap_start - start_time,
+                    end=overlap_end - start_time
+                )
+                new_instrument.notes.append(new_note)
+
+        if new_instrument.notes:
+            segment_midi.instruments.append(new_instrument)
+
+    return segment_midi
 def collate_fn(batch):
     """
     自定义collate函数，处理包含pretty_midi.PrettyMIDI对象的批次

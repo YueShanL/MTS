@@ -32,14 +32,14 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained("facebook/musicgen-melody")  # config.base_model_name_or_path)
 
     inputs = processor(
-        audio = wav.squeeze()[:5*32000],
+        audio = wav.squeeze()[:30*32000],
         sampling_rate = sample_rate,
         text=["piano cover"],
         padding=True,
         return_tensors="pt",
     ).to(device)
     inputs.data['input_features']=inputs.data['input_features'].to(torch.float16)
-    audio_values = model.generate(**inputs, do_sample=True, guidance_scale=3, max_new_tokens=256)
+    audio_values = model.generate(**inputs, do_sample=True, guidance_scale=3, max_new_tokens=256*6)
 
     sampling_rate = model.config.audio_encoder.sampling_rate
     audio_values = audio_values.cpu().float().numpy()

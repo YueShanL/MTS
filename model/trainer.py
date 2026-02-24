@@ -74,7 +74,7 @@ class MixedTrainer:
         )'''
         self.scheduler_lr = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda epoch: min((epoch + 1) / 10, 1.0)  # 前10个epoch预热
+            lr_lambda=lambda epoch: min((epoch + 1) / 1, 1.0)  # 前10个epoch预热
         )
         '''# 使用warmup策略
         self.scheduler_lr = torch.optim.lr_scheduler.OneCycleLR(
@@ -323,13 +323,14 @@ def collate_fn(batch):
             audio_list.append(Tensor(sample['audio_input']))
 
             # 2. 上下文数据 - 直接提取，假设结构固定
-            context_notes = sample['context_notes']
-            context_duration.append(Tensor(context_notes['duration']))
-            context_fret.append(Tensor(context_notes['fret']))
-            context_technique.append(Tensor(context_notes['technique']))
+            context_notes = sample.get('context_notes')
+            if context_notes:
+                context_duration.append(Tensor(context_notes['duration']))
+                context_fret.append(Tensor(context_notes['fret']))
+                context_technique.append(Tensor(context_notes['technique']))
 
             # 3. 目标数据
-            target_notes = sample['target_notes']
+            target_notes = sample.get('target_notes')
             target_duration.append(Tensor(target_notes['duration']))
             target_fret.append(Tensor(target_notes['fret']))
             target_technique.append(Tensor(target_notes['technique']))
@@ -337,17 +338,19 @@ def collate_fn(batch):
         # 使用torch.stack一次性堆叠，减少碎片化操作
         batched = {
             'audio_input': torch.stack(audio_list).unsqueeze(1),  # [B, 1, T]
-            'context_notes': {
-                'duration': torch.stack(context_duration).to(torch.int64),
-                'fret': torch.stack(context_fret).to(torch.int64),
-                'technique': torch.stack(context_technique).to(torch.int64)
-            },
             'target_notes': {
                 'duration': torch.stack(target_duration).to(torch.int64),
                 'fret': torch.stack(target_fret).to(torch.int64),
                 'technique': torch.stack(target_technique).to(torch.int64)
             }
         }
+        if len(context_duration) == len(target_duration):
+            batched['context_notes'] = {
+                    'duration': torch.stack(context_duration).to(torch.int64),
+                    'fret': torch.stack(context_fret).to(torch.int64),
+                    'technique': torch.stack(context_technique).to(torch.int64)
+                }
+
 
         return batched
 
@@ -478,13 +481,13 @@ def _generate_sample(model, data, output_path):
     if isinstance(audio, list):
         audio = Tensor(audio)
     audio = audio.unsqueeze(0).unsqueeze(1).to(device)
-    context = data['context_notes']
-    for key, value in context.items():
-        
-        if isinstance(value, list):
-            context[key] = Tensor(value).unsqueeze(0).to(device)
-        else:
-            context[key] = value.unsqueeze(0).to(device)
+    context = data.get('context_notes')
+    if context is not None:
+        for key, value in context.items():
+            if isinstance(value, list):
+                context[key] = Tensor(value).unsqueeze(0).to(device)
+            else:
+                context[key] = value.unsqueeze(0).to(device)
     target = data['target_notes']
     
     model.eval()
@@ -502,13 +505,18 @@ def _generate_sample(model, data, output_path):
     for key, value in generate_outputs.items():
         if value is not None:
             sample[key] = value[0]
+    try:
+        song = decode(sample)
 
-    song = decode(sample)
-    target = decode(target)
+        gp.write(song, f'{output_path}/out.gp5')
+    except Exception as e:
+        print(f'failed to save generated: {e}')
+    try:
+        target = decode(target)
 
-    gp.write(song, f'{output_path}/out.gp5')
-    
-    gp.write(target, f'{output_path}/target.gp5')
+        gp.write(target, f'{output_path}/target.gp5')
+    except Exception as e:
+        print(f'failed to save target: {e}')
 
 
 def _generate_loss_plot(all_losses, output_path):
