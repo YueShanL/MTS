@@ -5,6 +5,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+from datasets import IterableDataset, Dataset
 from matplotlib import pyplot as plt
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -148,7 +149,7 @@ class MixedTrainer:
             progress_bar.set_postfix(postfix_info)
 
 
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(loss_records)
         self.scheduler_lr.step(avg_loss)
 
         # 创建DataFrame
@@ -354,19 +355,49 @@ def collate_fn(batch):
 
         return batched
 
+
+def get_random_sample(dataset, max_index=None):
+    """
+    从数据集中随机获取一个样本。
+    支持 Map-style 数据集（有 __len__ 和 __getitem__）和 IterableDataset。
+
+    Args:
+        dataset: 数据集对象。
+        max_index: 对于 IterableDataset，随机跳过的最大步数（通常为总样本数估计值）。
+                   对 Map-style 数据集该参数会被忽略。
+    Returns:
+        单个数据样本。
+    """
+    # 检查是否为 Map-style 数据集（支持 len 和索引）
+    if isinstance(dataset, Dataset):
+        idx = random.randint(0, len(dataset) - 1)
+        return dataset[idx]
+    elif isinstance(dataset, IterableDataset) and max_index is not None:
+        skipped_dataset = dataset.skip(random.randint(0, max_index))
+        try:
+            return next(iter(skipped_dataset))
+        except StopIteration:
+            # 如果跳过太多导致空，回退到原始数据集的第一个样本
+            return next(iter(dataset))
+
+    raise RuntimeError("receiving iterable dataset without max_index!")
+
+
+
 def train_mixed_model(model, train_dataset, val_dataset=None,
-                      num_epochs=10, batch_size=8, scheduler_type='linear', output_path='.'):
+                      num_epochs=10, batch_size=8, scheduler_type='linear', output_path='.', epoches_len=None,):
     """完整的混合训练循环"""
 
     # 初始化组件
     config = model.config
+    epochs_len = len(train_dataset)//batch_size + 1 if epoches_len is None else epoches_len
 
     loss_fn = AutoregressiveMultiTaskLoss(config, use_focal=False)
-    trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=len(train_dataset)//batch_size + 1,scheduler_type= scheduler_type)
+    trainer = MixedTrainer(model, loss_fn, config, epoches=num_epochs, epochs_len=epochs_len,scheduler_type= scheduler_type)
 
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              collate_fn=collate_fn, shuffle=True, num_workers=4)
+                              collate_fn=collate_fn, num_workers=4)
 
     if val_dataset:
         val_loader = DataLoader(val_dataset, batch_size=batch_size,
@@ -384,7 +415,7 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
         # 验证
         val_loss = None
         if val_dataset:
-            val_loss = evaluate_model(model, loss_fn, val_loader)
+            val_loss, l = evaluate_model(model, loss_fn, val_loader)
 
             # 保存最佳模型
             if val_loss < best_val_loss:
@@ -395,8 +426,8 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
                 torch.save(model.state_dict(), f'{file_dir}/best_model_epoch{epoch}.pth')
                 if all_batch_losses:
                     _generate_loss_plot(all_batch_losses, f'{file_dir}')
-                _generate_sample(model, train_dataset[random.randint(0, len(train_dataset) - 1)], f'{file_dir}/train')
-                _generate_sample(model, val_dataset[random.randint(0, len(val_dataset) - 1)], f'{file_dir}/eval')
+                _generate_sample(model, get_random_sample(train_dataset, epoches_len * batch_size - 1), f'{file_dir}/train')
+                _generate_sample(model, get_random_sample(val_dataset, l * batch_size - 1), f'{file_dir}/eval')
 
         if (epoch + 1) % 10 == 0:
                 best_val_loss = val_loss
@@ -441,6 +472,7 @@ def evaluate_model(model, loss_fn, dataloader):
     """评估模型性能"""
     model.eval()
     total_loss = 0
+    l = 0
 
     with torch.no_grad():
         for batch in dataloader:
@@ -463,9 +495,10 @@ def evaluate_model(model, loss_fn, dataloader):
             # 计算损失
             loss, _ = loss_fn(logits, batch['target_notes'])
             total_loss += loss.item()
+            l +=1
 
     model.train()
-    return total_loss / len(dataloader)
+    return total_loss / l, l
 
 def _generate_sample(model, data, output_path):
     batch_size = 1
@@ -507,13 +540,11 @@ def _generate_sample(model, data, output_path):
             sample[key] = value[0]
     try:
         song = decode(sample)
-
         gp.write(song, f'{output_path}/out.gp5')
     except Exception as e:
         print(f'failed to save generated: {e}')
     try:
         target = decode(target)
-
         gp.write(target, f'{output_path}/target.gp5')
     except Exception as e:
         print(f'failed to save target: {e}')

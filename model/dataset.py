@@ -541,7 +541,10 @@ def decode(tab_sequence:Dict, tempo: int = 120, post_process=True):
                 measure_idx = idx // 16
                 position = (idx % 16) / 4
                 if fret != 25:
-                    generator.add_note(song, string + 1, fret.tolist(), dur, technique=GuitarTechnique(tab_sequence['technique'][idx][string].tolist()), position=position, measure_index=measure_idx)
+                    f = fret.tolist() if isinstance(fret, Tensor) else fret
+                    t = tab_sequence['technique'][idx][string]
+                    t = t.tolist() if isinstance(t, Tensor) else t
+                    generator.add_note(song, string + 1, f, dur, technique=GuitarTechnique(t), position=position, measure_index=measure_idx)
     if post_process:
         generator.post_process(song)
     return song
