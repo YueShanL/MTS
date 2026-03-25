@@ -73,7 +73,7 @@ def train(
         )
 
     # 初始化模型
-    model = MTSGen2(model_config)
+    model = MTSGen2(model_config).to('cuda')
 
     # 数据整理器
     collator = DataCollatorForMTSGen2WithWaveform(
