@@ -3,12 +3,16 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
+from torch import vmap
 from transformers import PreTrainedModel, PretrainedConfig, T5Config
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.t5.modeling_t5 import T5Stack
 
 import basic_pitch_torch.constants
 from basic_pitch_torch.model import BasicPitchTorch
+from model.MTS2.data import decode_token
+from model.dataset import decode
 
 
 # ---------- 配置类 ----------
@@ -47,6 +51,23 @@ class MTSGen2Config(PretrainedConfig):
         self.num_heads = num_heads
         self.decoder_start_token_id = decoder_start_token_id
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, base: int = 10000):
+        super().__init__()
+        self.d_model = d_model
+        self.base = base
+
+    def forward(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """返回形状 [seq_len, d_model] 的位置编码"""
+        position = torch.arange(seq_len, device=device).unsqueeze(1)  # [seq_len, 1]
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=device) *
+            (-torch.log(torch.tensor(self.base)) / self.d_model)
+        )
+        pe = torch.zeros(seq_len, self.d_model, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe
 
 # ---------- 主模型 ----------
 class MTSGen2(PreTrainedModel):
@@ -67,7 +88,7 @@ class MTSGen2(PreTrainedModel):
         self.input_proj = nn.Linear(basic_pitch_torch.constants.ANNOTATIONS_N_SEMITONES * 5, config.d_model)
 
         # ---------- 位置编码 ----------
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.d_model)
+        self.position_encoding = SinusoidalPositionalEncoding(config.d_model)
 
         # ---------- 因果编码器 ----------
         encoder_layer = nn.TransformerEncoderLayer(
@@ -110,13 +131,13 @@ class MTSGen2(PreTrainedModel):
     def get_encoder_outputs(self, input_features: torch.Tensor) -> torch.Tensor:
         """
         计算因果编码器输出 (memory)，供生成时使用。
-        input_features: [B, T, 264] Basic Pitch 堆叠特征
+        input_features: [B, T, 440] Basic Pitch 堆叠特征
         returns: [B, T, d_model]
         """
         x = self.input_proj(input_features)                     # [B, T, d_model]
         B, T, _ = x.shape
-        positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
-        x = x + self.position_embeddings(positions)             # [B, T, d_model]
+        pe = self.position_encoding(T, x.device)  # [T, d_model]
+        x = x + pe.unsqueeze(0)  # [B, T, d_model]
         causal_mask = self._generate_causal_mask(T).to(x.device)
         memory = self.memory_encoder(x, mask=causal_mask)       # [B, T, d_model]
         return memory
@@ -246,7 +267,7 @@ class MTSGen2(PreTrainedModel):
             raise ValueError("必须提供 audio_input")
         if audio_input is not None:
             # 提取特征并计算编码器输出
-            features = self.extract_features(audio_input)            # [B, T, 264]
+            features = self.extract_features(audio_input)            # [B, T, 440]
             encoder_outputs = self.get_encoder_outputs(features)    # [B, T, d_model]
 
         # 后续生成逻辑与之前相同
@@ -306,26 +327,32 @@ class MTSGen2(PreTrainedModel):
 
 # ---------- 使用示例 ----------
 if __name__ == "__main__":
-    config = MTSGen2Config(
-        d_model=512,
-        nhead=8,
-        num_encoder_layers=2,
-        num_decoder_layers=6,
-        num_heads=6,
-    )
-    model = MTSGen2(config)
+
+    model = MTSGen2.from_pretrained('../../output/Model/mts2/best').to('cuda')
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters()):,}")
     print(f"可训练参数: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     # 模拟一批 wav
-    batch_size, seq_len = 2, 20076
-    dummy_features = torch.randn(batch_size, seq_len)
+
+    wav, sr = torchaudio.load("test.mp3")
+
+    if sr != 22050:
+        resampler = torchaudio.transforms.Resample(sr, 22050)
+        wav = resampler(wav).mean(dim=0, keepdim=False)[:20*22050]
 
     # 2. 生成（默认起始 token ID = 0）
     generated = model.generate(
-        dummy_features,
-        max_length=79,
+        wav.to('cuda'),
+        max_length=80,
     )
 
+    fret, technique, duration = vmap(decode_token)(generated.to('cpu'))
+    duration = duration.to(float).mean(dim=2, keepdim=False).to(int)
+
+    song = decode({'fret': fret.squeeze(), 'technique': technique.squeeze(), 'duration': duration.squeeze()})
+
+    import guitarpro as gp
+    gp.write(song, f'out.gp5')
+
     # generated 形状 [2, seq_len, 6]，每个 token ID 范围 0~4367
-    print("生成结果形状:", generated.shape)
-    print("第一个时间步六个头的 token IDs:", generated[0, 0].tolist())
+    #print("生成结果形状:", generated.shape)
+    #print("第一个时间步六个头的 token IDs:", generated[0, 0].tolist())

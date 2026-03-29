@@ -22,7 +22,7 @@ def decode_token(token_id: int, offset: int = 1) -> tuple:
     """
     将 token ID 解码为 (note, technique, duration)。
     """
-    assert token_id >= offset, f"token_id {token_id} < offset {offset}"
+    #assert token_id >= offset, f"token_id {token_id} < offset {offset}"
     idx = token_id - offset
     note = idx // (14 * 13)
     remainder = idx % (14 * 13)
