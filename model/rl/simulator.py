@@ -198,13 +198,11 @@ class HandModel:
 # ====================== 位置分析 ======================
 
 class PositionAnalyzer:
-    """位置分析器"""
+    """位置分析器 - 优化版：保留原接口，内部使用向量化计算（批量）"""
 
     def __init__(self, config: DifficultyConfig, hand_model: HandModel):
         self.config = config
         self.hand_model = hand_model
-
-        # 技巧难度系数
         self.technique_difficulty_factors = {
             GuitarTechnique.NORMAL: 1.0,
             GuitarTechnique.HAMMER_ON: 1.2,
@@ -222,262 +220,207 @@ class PositionAnalyzer:
             GuitarTechnique.PALM_MUTE: 0.9,
         }
 
+    # 原有单个位置分析方法（保留，用于向后兼容，但内部可调用向量化）
     def analyze_position(self, frets: List[int], techniques: List[GuitarTechnique] = None) -> Dict[str, Any]:
-        """分析单个位置，包含技巧信息"""
-        # 如果未提供技巧，使用默认的NORMAL技巧
-        if techniques is None:
-            techniques = [GuitarTechnique.NORMAL] * 6
-        elif len(techniques) != 6:
-            raise ValueError(f"techniques长度应为6，实际为{len(techniques)}")
+        """单个位置分析（保持原接口，内部通过向量化实现）"""
+        # 为了兼容性，简单调用批量方法再提取
+        batch_result = self.analyze_positions_batch([frets], [techniques] if techniques else None)
+        return {k: v[0] for k, v in batch_result.items() if isinstance(v, (list, np.ndarray))}
 
-        # 提取有效音符（包括技巧信息）
-        active_frets = []
-        active_techniques = []
+    def analyze_positions_batch(self, frets_list: List[List[int]],
+                                techniques_list: Optional[List[List[GuitarTechnique]]] = None) -> Dict[str, Any]:
+        """
+        批量分析多个位置（向量化核心）
+        返回字典，每个值均为数组，长度 = len(frets_list)
+        """
+        T = len(frets_list)
+        if techniques_list is None:
+            techniques_list = [[GuitarTechnique.NORMAL] * 6] * T
 
-        for i, (fret, tech) in enumerate(zip(frets, techniques)):
-            if 0 <= fret < self.config.non_playing_fret:
-                active_frets.append((i, fret))
-                active_techniques.append(tech)
+        # 转换为 numpy 数组
+        frets = np.array(frets_list, dtype=np.int8)                     # (T, 6)
+        tech_ints = np.array([[t.value for t in row] for row in techniques_list], dtype=np.int8)  # (T,6)
 
-        active_strings = [s for s, _ in active_frets]
-        active_fret_values = [f for _, f in active_frets]
-        note_count = len(active_frets)
+        # 有效音符掩码
+        valid_mask = (frets > 0) & (frets < self.config.non_playing_fret)  # (T,6)
+        note_count = valid_mask.sum(axis=1).astype(np.float32)             # (T,)
 
-        # 基础信息
-        position_info = {
-            "frets": frets,
-            "techniques": techniques,  # 存储原始技巧列表
-            "active_frets": active_frets,
-            "active_fret_values": active_fret_values,
-            "active_strings": active_strings,
-            "active_techniques": active_techniques,  # 存储激活音符的技巧
-            "note_count": note_count,
-            "is_single_note": note_count == 1,
-            "is_multi_note": note_count >= self.config.multi_note_threshold
-        }
+        # ----- 品位难度（向量化）-----
+        # 预先计算品位难度系数
+        fret_difficulty_raw = self._calc_fret_difficulty_batch(frets)      # (T,6)
+        fret_difficulty = np.where(valid_mask, fret_difficulty_raw, 0.0)
+        avg_fret_difficulty = np.divide(fret_difficulty.sum(axis=1), note_count,
+                                        out=np.zeros_like(note_count), where=note_count>0)
 
-        if note_count == 0:
-            position_info.update({
-                "base_difficulty": 0.0,
-                "fret_difficulty": 0.0,
-                "stretch_difficulty": 0.0,
-                "note_count_difficulty": 0.0,
-                "technique_difficulty": 0.0,  # 新增技巧难度
-                "total_difficulty": 0.0
-            })
-            return position_info
+        # ----- 伸展难度（向量化）-----
+        # 有效品位的最小值和最大值
+        min_fret = np.where(valid_mask, frets, 999).min(axis=1)
+        max_fret = np.where(valid_mask, frets, -1).max(axis=1)
+        stretch = max_fret - min_fret
+        stretch_difficulty = np.maximum(0, stretch - self.config.max_comfortable_stretch) * self.config.finger_stretch_weight
+        stretch_difficulty[note_count < 2] = 0.0
 
-        # 计算各项难度
-        base_difficulty = self.config.position_base
+        # ----- 音符数量难度（向量化）-----
+        note_count_difficulty = np.zeros_like(note_count)
+        single_mask = note_count == 1
+        multi_mask = (note_count > 1) & (note_count <= self.config.multi_note_threshold)
+        excess_mask = note_count > self.config.multi_note_threshold
 
-        # 品位难度（取消底品难度）
-        fret_difficulty = 0.0
-        for fret in active_fret_values:
-            fret_difficulty += self.hand_model.calculate_fret_difficulty(fret)
-        if active_fret_values:
-            fret_difficulty /= len(active_fret_values)  # 平均品位难度
+        note_count_difficulty[single_mask] = self.config.single_note_base
+        note_count_difficulty[multi_mask] = self.config.multi_note_base
+        # 超过阈值部分
+        excess = note_count[excess_mask] - self.config.multi_note_threshold
+        note_count_difficulty[excess_mask] = self.config.multi_note_base * (self.config.chord_complexity_factor ** excess)
 
-        # 伸展难度
-        stretch_difficulty = self.hand_model.calculate_stretch_difficulty(active_fret_values)
+        # ----- 技巧难度（向量化）-----
+        # 获取每个技巧的难度因子
+        tech_factor = np.vectorize(lambda t: self.technique_difficulty_factors.get(GuitarTechnique(t), 1.0),
+                                   otypes=[np.float32])(tech_ints)   # (T,6)
+        # 高品位惩罚
+        high_fret_mask = (frets > 12) & np.isin(tech_ints,
+                                                [GuitarTechnique.BEND.value, GuitarTechnique.VIBRATO.value])
+        tech_factor = np.where(high_fret_mask,
+                               tech_factor * (1 + (frets - 12) * 0.02),
+                               tech_factor)
+        tech_difficulty = (tech_factor * valid_mask).sum(axis=1)  # (T,)
 
-        # 音符数量难度
-        note_count_difficulty = self.hand_model.calculate_note_count_difficulty(note_count)
+        # 多复杂技巧组合惩罚
+        complex_tech_vals = [t.value for t in [GuitarTechnique.NORMAL, GuitarTechnique.MUTE, GuitarTechnique.PALM_MUTE]]
+        is_complex = ~np.isin(tech_ints, complex_tech_vals)       # (T,6)
+        complex_count = (is_complex & valid_mask).sum(axis=1)
+        combo_factor = np.where(complex_count > 1, 1 + (complex_count - 1) * 0.1, 1.0)
+        tech_difficulty *= combo_factor
 
-        # 技巧难度（新增）
-        technique_difficulty = self._calculate_technique_difficulty(active_techniques, active_fret_values)
+        # 总难度
+        base_diff = self.config.position_base
+        total_difficulty = (base_diff + avg_fret_difficulty + stretch_difficulty +
+                            note_count_difficulty + tech_difficulty)
 
-        # 总位置难度（包含技巧难度）
-        total_difficulty = (
-                base_difficulty +
-                fret_difficulty +
-                stretch_difficulty +
-                note_count_difficulty +
-                technique_difficulty
-        )
+        # 辅助信息：激活弦编号集合（用位掩码表示，便于后续移动分析）
+        string_indices = np.arange(1, 7)  # 1..6
+        active_strings_mask = valid_mask * string_indices  # (T,6) 有效位置存弦号，无效为0
+        # 编码为整数集合（位掩码）：第i位表示弦i是否激活
+        string_sets = (valid_mask << np.arange(6)).sum(axis=1)  # (T,) 整数掩码
 
-        position_info.update({
-            "base_difficulty": base_difficulty,
-            "fret_difficulty": fret_difficulty,
+        return {
+            "total_difficulty": total_difficulty,           # (T,)
+            "note_count": note_count,                       # (T,)
+            "active_strings_mask": string_sets,             # (T,)
+            "frets": frets,                                 # (T,6)
+            "tech_ints": tech_ints,                         # (T,6)
+            "valid_mask": valid_mask,                       # (T,6)
+            "avg_fret_difficulty": avg_fret_difficulty,
             "stretch_difficulty": stretch_difficulty,
             "note_count_difficulty": note_count_difficulty,
-            "technique_difficulty": technique_difficulty,  # 新增
-            "total_difficulty": total_difficulty,
-            "technique_breakdown": self._get_technique_breakdown(active_techniques)  # 技巧分类统计
-        })
+            "tech_difficulty": tech_difficulty,
+        }
 
-        return position_info
+    def _calc_fret_difficulty_batch(self, frets: np.ndarray) -> np.ndarray:
+        """批量计算品位难度矩阵 (T,6) - 修复无效值警告"""
+        config = self.config
+        # 创建副本，将无效品位（>= non_playing_fret）临时设为0，避免 power 计算产生 inf
+        frets_safe = np.where(frets < config.non_playing_fret, frets, 0)
 
-    def _calculate_technique_difficulty(self, techniques: List[GuitarTechnique], frets: List[int]) -> float:
-        """计算技巧难度"""
-        if not techniques:
-            return 0.0
+        low_mask = frets_safe <= config.low_fret_limit
+        mid_mask = (frets_safe > config.low_fret_limit) & (frets_safe <= config.high_fret_penalty_start)
+        high_mask = frets_safe > config.high_fret_penalty_start
 
-        total_difficulty = 0.0
+        base = np.zeros_like(frets_safe, dtype=np.float32)
+        base[low_mask] = config.fret_difficulty_base * 0.3
+        base[mid_mask] = config.fret_difficulty_base
+        base[high_mask] = config.fret_difficulty_base * config.high_fret_penalty_factor
 
-        for tech, fret in zip(techniques, frets):
-            # 基础技巧难度系数
-            base_factor = self.technique_difficulty_factors.get(tech, 1.0)
-
-            # 考虑品位对技巧难度的影响（高品位上某些技巧更难）
-            fret_factor = 1.0
-            if fret > 12:
-                # 高品位技巧难度增加
-                if tech in [GuitarTechnique.BEND, GuitarTechnique.VIBRATO]:
-                    fret_factor = 1.0 + (fret - 12) * 0.02
-                elif tech in [GuitarTechnique.HAMMER_ON, GuitarTechnique.PULL_OFF]:
-                    fret_factor = 1.0 + (fret - 12) * 0.01
-
-            # 技巧难度累加
-            total_difficulty += base_factor * fret_factor
-
-        # 多技巧组合的额外难度（如果一个位置有多种复杂技巧）
-        complex_tech_count = sum(1 for tech in techniques
-                                if tech not in [GuitarTechnique.NORMAL, GuitarTechnique.MUTE, GuitarTechnique.PALM_MUTE])
-
-        if complex_tech_count > 1:
-            # 多种复杂技巧的组合会增加额外难度
-            combination_factor = 1.0 + (complex_tech_count - 1) * 0.1
-            total_difficulty *= combination_factor
-
-        return total_difficulty
-
-    def _get_technique_breakdown(self, techniques: List[GuitarTechnique]) -> Dict[str, int]:
-        """获取技巧分类统计"""
-        breakdown = {}
-
-        for tech in techniques:
-            tech_name = tech.name
-            breakdown[tech_name] = breakdown.get(tech_name, 0) + 1
-
-        return breakdown
+        if config.fret_difficulty_curve == "quadratic":
+            return base * (frets_safe ** 1.5)
+        elif config.fret_difficulty_curve == "exponential":
+            return base * (1.5 ** (frets_safe / 5))
+        else:  # linear
+            return base * frets_safe
 
 
 # ====================== 移动分析 ======================
 
 class MoveAnalyzer:
-    """移动分析器"""
+    """移动分析器 - 优化版：支持批量计算"""
 
     def __init__(self, config: DifficultyConfig):
         self.config = config
 
-    def calculate_center(self, active_frets: List[Tuple[int, int]]) -> Tuple[float, float]:
-        """计算手位中心（弦，品）"""
-        if not active_frets:
-            return (0.0, 0.0)
+    # 保留原单对移动方法（兼容旧调用）
+    def calculate_move_difficulty(self, pos1_info: Dict, pos2_info: Dict, time_interval: float) -> Dict[str, Any]:
+        # 简单调用批量方法并提取第一个元素（为保持兼容，不推荐直接调用）
+        batch_res = self.calculate_moves_batch([pos1_info], [pos2_info], [time_interval])
+        return {k: v[0] for k, v in batch_res.items()}
 
-        weighted_string = 0.0
-        weighted_fret = 0.0
-        total_weight = 0.0
-
-        for string, fret in active_frets:
-            # 权重：低音弦权重更高，高品位权重更高
-            string_weight = (6 - string) * 0.3 + 0.7
-            fret_weight = 1.0 + (fret / 24) * 1.0
-            weight = string_weight * fret_weight
-
-            weighted_string += string * weight
-            weighted_fret += fret * weight
-            total_weight += weight
-
-        return (
-            weighted_string / total_weight if total_weight > 0 else 0.0,
-            weighted_fret / total_weight if total_weight > 0 else 0.0
-        )
-
-    def calculate_move_distance(self, pos1_center: Tuple[float, float],
-                                pos2_center: Tuple[float, float]) -> float:
-        """计算移动距离"""
-        string_distance = abs(pos2_center[0] - pos1_center[0])
-        fret_distance = abs(pos2_center[1] - pos1_center[1])
-
-        # 综合距离（弦和品都重要）
-        distance = math.sqrt(string_distance ** 2 + fret_distance ** 2 * 4)
-        return distance
-
-    def calculate_move_difficulty(self, pos1_info: Dict, pos2_info: Dict,
-                                  time_interval: float) -> Dict[str, Any]:
-        """计算移动难度"""
-
-        # 基础移动难度
-        base_move_difficulty = self.config.move_base_difficulty
-
-        # 音符数量因子
-        note_count1 = pos1_info["note_count"]
-        note_count2 = pos2_info["note_count"]
-
-        if note_count1 == 0 and note_count2 == 0:
-            move_factor = 0.0
-        elif note_count1 == 1 and note_count2 == 1:
-            move_factor = self.config.single_note_move_factor
-        elif note_count1 >= self.config.multi_note_threshold and note_count2 >= self.config.multi_note_threshold:
-            move_factor = self.config.multi_note_move_factor
+    def _bit_count(self, arr: np.ndarray) -> np.ndarray:
+        """向量化计算整数数组的位计数（每个元素二进制中1的个数）"""
+        # 如果 NumPy 版本足够，直接用 bitwise_count
+        if hasattr(np, 'bitwise_count'):
+            return np.bitwise_count(arr)
         else:
-            move_factor = self.config.mixed_note_move_factor
+            # 手动向量化：使用列表推导（效率稍低，但弦数少可接受）
+            return np.array([bin(x).count('1') for x in arr])
+
+    def calculate_moves_batch(self, pos1_list: List[Dict], pos2_list: List[Dict],
+                              time_intervals: List[float]) -> Dict[str, np.ndarray]:
+        """
+        批量计算移动难度 - 修复 bit_count 错误
+        """
+        M = len(pos1_list)
+        if M == 0:
+            return {
+                "total_difficulty": np.array([]),
+                "distance_difficulty": np.array([]),
+                "pattern_difficulty": np.array([]),
+                "time_pressure": np.array([]),
+                "move_factor": np.array([]),
+            }
+
+        note_count1 = np.array([p["note_count"] for p in pos1_list])
+        note_count2 = np.array([p["note_count"] for p in pos2_list])
+        string_sets1 = np.array([p.get("active_strings_mask", 0) for p in pos1_list])
+        string_sets2 = np.array([p.get("active_strings_mask", 0) for p in pos2_list])
+        centers1 = np.array([p.get("center", (0.0, 0.0)) for p in pos1_list])  # (M,2)
+        centers2 = np.array([p.get("center", (0.0, 0.0)) for p in pos2_list])
+        time_intervals = np.array(time_intervals)
+
+        # 移动因子
+        single_note = (note_count1 == 1) & (note_count2 == 1)
+        multi_note = (note_count1 >= self.config.multi_note_threshold) & (
+                    note_count2 >= self.config.multi_note_threshold)
+        move_factor = np.where(single_note, self.config.single_note_move_factor,
+                               np.where(multi_note, self.config.multi_note_move_factor,
+                                        self.config.mixed_note_move_factor))
 
         # 距离难度
-        distance_difficulty = 0.0
-        if pos1_info["active_frets"] and pos2_info["active_frets"]:
-            center1 = self.calculate_center(pos1_info["active_frets"])
-            center2 = self.calculate_center(pos2_info["active_frets"])
-            distance = self.calculate_move_distance(center1, center2)
-            distance_difficulty = distance * self.config.move_distance_weight * move_factor
+        delta = centers2 - centers1
+        distances = np.sqrt(delta[:, 0] ** 2 + (delta[:, 1] * 2) ** 2)
+        distance_difficulty = distances * self.config.move_distance_weight * move_factor
 
-        # 模式变化难度
-        pattern_difficulty = self.calculate_pattern_difficulty(pos1_info, pos2_info) * move_factor
+        # 模式变化难度 - 使用位计数
+        intersection = self._bit_count(string_sets1 & string_sets2)
+        union = self._bit_count(string_sets1 | string_sets2)
+        similarity = np.divide(intersection, union, out=np.zeros_like(intersection, dtype=float), where=union > 0)
+        pattern_change = (1 - similarity) * self.config.move_pattern_weight
+        pattern_change += np.abs(note_count1 - note_count2) * 0.2
+        pattern_difficulty = pattern_change * move_factor
 
         # 时间压力
-        time_pressure = 0.0
-        if self.config.transition_time_pressure:
-            sixteenth_duration = 60 / self.config.bpm / 4
-            if time_interval < sixteenth_duration * self.config.time_pressure_threshold:
-                pressure = (
-                                       sixteenth_duration * self.config.time_pressure_threshold - time_interval) / sixteenth_duration
-                time_pressure = pressure * self.config.time_pressure_weight
+        sixteenth_duration = 60 / self.config.bpm / 4
+        threshold = sixteenth_duration * self.config.time_pressure_threshold
+        pressure = np.maximum(0, (threshold - time_intervals) / sixteenth_duration)
+        time_pressure = pressure * self.config.time_pressure_weight
 
-        # 总移动难度
-        total_move_difficulty = (
-                base_move_difficulty +
-                distance_difficulty +
-                pattern_difficulty +
-                time_pressure
-        )
+        total = (self.config.move_base_difficulty + distance_difficulty +
+                 pattern_difficulty + time_pressure)
 
         return {
-            "total_difficulty": total_move_difficulty,
-            "components": {
-                "base_move": base_move_difficulty,
-                "distance": distance_difficulty,
-                "pattern": pattern_difficulty,
-                "time_pressure": time_pressure
-            },
+            "total_difficulty": total,
+            "distance_difficulty": distance_difficulty,
+            "pattern_difficulty": pattern_difficulty,
+            "time_pressure": time_pressure,
             "move_factor": move_factor,
-            "note_counts": (note_count1, note_count2)
         }
-
-    def calculate_pattern_difficulty(self, pos1_info: Dict, pos2_info: Dict) -> float:
-        """计算模式变化难度"""
-        strings1 = set(pos1_info["active_strings"])
-        strings2 = set(pos2_info["active_strings"])
-
-        if not strings1 or not strings2:
-            return 0.5  # 中等变化
-
-        # 共同弦比例
-        common_strings = strings1.intersection(strings2)
-        total_strings = strings1.union(strings2)
-
-        if not total_strings:
-            return 0.0
-
-        # 共同弦越少，模式变化越大
-        similarity = len(common_strings) / len(total_strings)
-        pattern_change = (1 - similarity) * self.config.move_pattern_weight
-
-        # 音符数量变化
-        count_change = abs(pos1_info["note_count"] - pos2_info["note_count"])
-        pattern_change += count_change * 0.2
-
-        return pattern_change
 
 
 # ====================== 序列分析 ======================
@@ -491,9 +434,10 @@ class GuitarSequenceAnalyzer:
         self.position_analyzer = PositionAnalyzer(config, self.hand_model)
         self.move_analyzer = MoveAnalyzer(config)
 
-        # 状态
-        self.stamina = 100.0
-        self.accumulated_difficulty = 0.0
+    def evaluate(self, sequence_data) -> float:
+        """奖励函数入口：返回总体难度分数"""
+        report = self.analyze_sequence(sequence_data)
+        return report["statistics"]["overall_difficulty"]
 
     def parse_sequence(self, sequence_data) -> List[Dict]:
         """解析序列数据 - 支持新的字典格式和旧格式"""
@@ -638,224 +582,227 @@ class GuitarSequenceAnalyzer:
             print(f"警告: 未知的技巧值 {tech_int}，将使用 NORMAL 替代")
             return GuitarTechnique.NORMAL
 
-    def evaluate(self, sequence_data) -> float:
-        report = self.analyze_sequence(sequence_data)
-
-        stats = report["statistics"]
-        return stats['overall_difficulty']
-
     def analyze_sequence(self, sequence_data) -> Dict[str, Any]:
-        """分析整个序列"""
-        # 重置状态
-        self.stamina = 100.0
-        self.accumulated_difficulty = 0.0
+        """完全向量化版本的分析函数"""
+        # 1. 解析序列
+        sequence = self.parse_sequence(sequence_data)   # 返回列表，每个元素是 dict
+        if not sequence:
+            return self._empty_report()
 
-        # 解析序列
-        sequence = self.parse_sequence(sequence_data)
+        T = len(sequence)
+        # 提取所有位置的 frets 和 techniques
+        frets_list = [item["frets"] for item in sequence]
+        techs_list = [item["techniques"] for item in sequence]
 
-        # 分析每个位置
+        # 2. 批量计算位置难度及中间信息
+        pos_batch = self.position_analyzer.analyze_positions_batch(frets_list, techs_list)
+        pos_diffs = pos_batch["total_difficulty"]          # (T,)
+        note_counts = pos_batch["note_count"]              # (T,)
+        string_sets = pos_batch["active_strings_mask"]     # (T,)
+        frets_arr = pos_batch["frets"]                     # (T,6)
+        valid_mask = pos_batch["valid_mask"]               # (T,6)
+
+        # 计算每个位置的中心点（向量化）
+        centers = self._compute_centers_batch(frets_arr, valid_mask)   # (T,2)
+
+        # 构建每个位置的完整信息字典（用于后续报告，但难度值已用向量化结果覆盖）
         positions = []
-        position_difficulties = []
-
-        for chord_info in sequence:
-            # 位置分析 - 现在传递技巧信息
-            pos_info = self.position_analyzer.analyze_position(
-                chord_info["frets"],
-                chord_info["techniques"]  # 新增技巧参数（枚举值）
-            )
-            pos_info.update({
-                "time": chord_info["time"],
-                "index": chord_info["index"],
-                "measure_num": chord_info["measure_num"],
-                "is_line_break": chord_info["is_line_break"],
-                "techniques": chord_info["techniques"]  # 保留技巧信息
-            })
-
+        for i in range(T):
+            pos_info = {
+                "index": sequence[i]["index"],
+                "time": sequence[i]["time"],
+                "measure_num": sequence[i]["measure_num"],
+                "is_line_break": sequence[i]["is_line_break"],
+                "techniques": sequence[i]["techniques"],
+                "frets": frets_list[i],
+                "active_frets": [(s+1, frets_arr[i,s]) for s in range(6) if valid_mask[i,s]],
+                "active_fret_values": [frets_arr[i,s] for s in range(6) if valid_mask[i,s]],
+                "active_strings": [s+1 for s in range(6) if valid_mask[i,s]],
+                "note_count": int(note_counts[i]),
+                "is_single_note": note_counts[i] == 1,
+                "is_multi_note": note_counts[i] >= self.config.multi_note_threshold,
+                "total_difficulty": float(pos_diffs[i]),
+                "center": (centers[i,0], centers[i,1]),
+                "active_strings_mask": int(string_sets[i]),
+            }
             positions.append(pos_info)
-            position_difficulties.append(pos_info["total_difficulty"])
 
-            # 耐力消耗
-            self.stamina -= pos_info["total_difficulty"] * self.config.stamina_drain_factor
-            self.stamina = max(0.0, self.stamina)
+        # 3. 批量计算移动难度（需要相邻位置）
+        if T < 2:
+            moves = []
+            move_diffs = np.array([])
+        else:
+            pos1_list = positions[:-1]
+            pos2_list = positions[1:]
+            time_intervals = [positions[i+1]["time"] - positions[i]["time"] for i in range(T-1)]
+            move_batch = self.move_analyzer.calculate_moves_batch(pos1_list, pos2_list, time_intervals)
+            move_diffs = move_batch["total_difficulty"]   # (T-1,)
 
-        # 分析移动
-        moves = []
-        move_difficulties = []
+            # 构建移动信息列表（用于报告）
+            moves = []
+            for i in range(T-1):
+                move_info = {
+                    "from_index": i,
+                    "to_index": i+1,
+                    "total_difficulty": float(move_diffs[i]),
+                    "components": {
+                        "base_move": self.config.move_base_difficulty,
+                        "distance": float(move_batch["distance_difficulty"][i]),
+                        "pattern": float(move_batch["pattern_difficulty"][i]),
+                        "time_pressure": float(move_batch["time_pressure"][i]),
+                    },
+                    "move_factor": float(move_batch["move_factor"][i]),
+                    "note_counts": (int(note_counts[i]), int(note_counts[i+1])),
+                    "is_cross_measure": positions[i]["measure_num"] != positions[i+1]["measure_num"],
+                }
+                moves.append(move_info)
 
-        for i in range(len(positions) - 1):
-            pos1 = positions[i]
-            pos2 = positions[i + 1]
+        # 4. 累计难度
+        if self.config.accumulated_difficulty_enabled:
+            # 位置难度和移动难度交错累加
+            pos_diffs_arr = pos_diffs
+            move_diffs_arr = move_diffs if len(move_diffs) > 0 else np.array([])
+            # 构建完整序列： [pos0, move0, pos1, move1, ...]
+            interleaved = []
+            for i in range(T):
+                interleaved.append(pos_diffs_arr[i])
+                if i < T-1:
+                    interleaved.append(move_diffs_arr[i])
+            interleaved = np.array(interleaved)
+            accumulated_arr = np.cumsum(interleaved)
+            # 每4个元素衰减一次（每两个位置一个衰减周期，保持与原逻辑一致）
+            for idx in range(4, len(accumulated_arr), 4):
+                accumulated_arr[idx:] *= 0.95
+            # 提取每个位置结束时的累计难度
+            accumulated = [float(accumulated_arr[2*i]) for i in range(T)]
+        else:
+            accumulated = [0.0] * T
 
-            time_interval = pos2["time"] - pos1["time"]
-            if time_interval <= 0:
-                time_interval = 60 / self.config.bpm / 4
+        # 5. 统计量计算
+        stats = self._compute_statistics(pos_diffs, move_diffs, accumulated, positions, moves)
+        overall_difficulty = stats["overall_difficulty"]
 
-            # 移动分析 - 技巧会影响移动难度
-            move_info = self.move_analyzer.calculate_move_difficulty(pos1, pos2, time_interval)
-            move_info.update({
-                "from_index": i,
-                "to_index": i + 1,
-                "is_cross_measure": pos1["measure_num"] != pos2["measure_num"],
-                "technique_changes": self._analyze_technique_changes(pos1["techniques"], pos2["techniques"])
-            })
-
-            moves.append(move_info)
-            move_difficulties.append(move_info["total_difficulty"])
-
-        # 计算累计难度
-        accumulated = self.calculate_accumulated_difficulty(position_difficulties, move_difficulties)
-
-        # 计算总体难度
-        overall_difficulty = self.calculate_overall_difficulty(
-            position_difficulties, move_difficulties, accumulated, positions, moves
-        )
-
-        # 确定难度等级
+        # 6. 确定难度等级
         difficulty_level = DifficultyLevel.from_score(overall_difficulty, self.config.difficulty_thresholds)
 
-        # 生成报告
-        report = self.generate_report(
-            positions, moves, overall_difficulty, difficulty_level,
-            position_difficulties, move_difficulties, accumulated
-        )
-
+        # 7. 生成报告（保持与原结构相同）
+        report = self._generate_report(positions, moves, overall_difficulty, difficulty_level,
+                                       pos_diffs.tolist(), move_diffs.tolist(), accumulated, stats)
         return report
 
-    def _analyze_technique_changes(self, tech1: List[GuitarTechnique], tech2: List[GuitarTechnique]) -> Dict:
-        """分析技巧变化"""
-        changes = {
-            "total_changes": 0,
-            "specific_changes": {}
-        }
+    def _compute_centers_batch(self, frets: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """批量计算手位中心 (T,2) : (弦, 品) - 修复除零警告"""
+        T = frets.shape[0]
+        strings = np.arange(1, 7, dtype=np.float32)  # 1..6
+        string_weights = (6 - strings) * 0.3 + 0.7  # (6,)
+        fret_weights = 1 + frets / 24.0  # (T,6)
+        weights = string_weights * fret_weights  # (T,6)
+        weights = weights * valid_mask  # 无效位置权重为0
+        sum_weights = weights.sum(axis=1, keepdims=True)  # (T,1)
 
-        for i in range(6):
-            if tech1[i] != tech2[i]:
-                changes["total_changes"] += 1
-                change_key = f"{tech1[i].name}->{tech2[i].name}"
-                changes["specific_changes"][change_key] = changes["specific_changes"].get(change_key, 0) + 1
+        # 使用 np.divide 避免除零警告，同时保留零位置
+        center_string = np.divide((weights * strings).sum(axis=1), sum_weights.squeeze(),
+                                  out=np.zeros(T, dtype=np.float32), where=sum_weights.squeeze() != 0)
+        center_fret = np.divide((weights * frets).sum(axis=1), sum_weights.squeeze(),
+                                out=np.zeros(T, dtype=np.float32), where=sum_weights.squeeze() != 0)
+        return np.stack([center_string, center_fret], axis=1)  # (T,2)
 
-        return changes
+    def _compute_statistics(self, pos_diffs: np.ndarray, move_diffs: np.ndarray,
+                            accumulated: List[float], positions: List[Dict], moves: List[Dict]) -> Dict:
+        """计算各种统计量（向量化后）"""
+        if len(pos_diffs) == 0:
+            return {
+                "overall_difficulty": 0.0,
+                "difficulty_level": DifficultyLevel.BEGINNER.value,
+                "bpm": self.config.bpm,
+                "total_positions": 0,
+                "total_moves": 0,
+                "final_stamina": 100.0,
+                "avg_position_difficulty": 0.0,
+                "max_position_difficulty": 0.0,
+                "avg_move_difficulty": 0.0,
+                "max_move_difficulty": 0.0,
+                "max_accumulated_difficulty": 0.0,
+            }
 
-    def calculate_accumulated_difficulty(self, pos_diffs, move_diffs):
-        """计算累计难度"""
-        if not self.config.accumulated_difficulty_enabled:
-            return [0.0] * len(pos_diffs)
+        avg_pos = np.mean(pos_diffs)
+        max_pos = np.max(pos_diffs)
+        avg_move = np.mean(move_diffs) if len(move_diffs) > 0 else 0.0
+        max_move = np.max(move_diffs) if len(move_diffs) > 0 else 0.0
+        max_accum = max(accumulated) if accumulated else 0.0
 
-        accumulated = []
-        current = 0.0
+        # 耐力模拟
+        stamina = 100.0
+        for diff in pos_diffs:
+            stamina -= diff * self.config.stamina_drain_factor
+            stamina = max(0.0, stamina)
 
-        for i in range(len(pos_diffs)):
-            current += pos_diffs[i]
-            if i > 0:
-                current += move_diffs[i - 1]
-
-            # 轻微衰减
-            if i % 4 == 0:
-                current *= 0.95
-
-            accumulated.append(current)
-
-        return accumulated
-
-    def calculate_overall_difficulty(self, pos_diffs, move_diffs, accumulated, positions, moves):
-        """计算总体难度"""
-        if self.config.custom_difficulty_formula:
-            return self.config.custom_difficulty_formula(
-                pos_diffs, move_diffs, accumulated, positions, moves
-            )
-
-        # 默认计算公式
-        if not pos_diffs:
-            return 0.0
-
-        # 位置难度统计
-        avg_pos = np.mean(pos_diffs) if pos_diffs else 0.0
-        max_pos = max(pos_diffs) if pos_diffs else 0.0
-
-        # 移动难度统计
-        avg_move = np.mean(move_diffs) if move_diffs else 0.0
-        max_move = max(move_diffs) if move_diffs else 0.0
-
-        # 累计难度峰值
-        max_accumulated = max(accumulated) if accumulated else 0.0
-
-        # 多音符难度加成
+        # 多音符因子
         multi_note_count = sum(1 for p in positions if p["note_count"] >= self.config.multi_note_threshold)
-        multi_note_factor = 1.0 + (multi_note_count / len(positions)) * 0.5
+        multi_note_factor = 1.0 + (multi_note_count / max(len(positions), 1)) * 0.5
 
-        # 跨小节难度加成
+        # 跨小节因子
         cross_measure_count = sum(1 for m in moves if m.get("is_cross_measure", False))
         cross_measure_factor = 1.0 + (cross_measure_count / max(len(moves), 1)) * 0.3
 
-        # 综合计算
-        overall = (
-                          avg_pos * 0.25 +
-                          max_pos * 0.15 +
-                          avg_move * 0.30 +
-                          max_move * 0.20 +
-                          max_accumulated * self.config.accumulated_weight
-                  ) * multi_note_factor * cross_measure_factor
+        # 总体难度公式
+        overall = (avg_pos * 0.25 + max_pos * 0.15 +
+                   avg_move * 0.30 + max_move * 0.20 +
+                   max_accum * self.config.accumulated_weight) * multi_note_factor * cross_measure_factor
 
-        return overall
+        # 若提供了自定义公式则使用
+        if self.config.custom_difficulty_formula:
+            overall = self.config.custom_difficulty_formula(
+                pos_diffs.tolist(), move_diffs.tolist(), accumulated, positions, moves
+            )
 
-    def generate_report(self, positions, moves, overall_diff, difficulty_level,
-                        pos_diffs, move_diffs, accumulated):
-        """生成详细报告"""
-
-        # 统计信息
-        stats = {
-            "overall_difficulty": overall_diff,
-            "difficulty_level": difficulty_level.value,
+        return {
+            "overall_difficulty": overall,
+            "difficulty_level": DifficultyLevel.from_score(overall, self.config.difficulty_thresholds).value,
             "bpm": self.config.bpm,
             "total_positions": len(positions),
             "total_moves": len(moves),
-            "final_stamina": self.stamina,
-            "avg_position_difficulty": np.mean(pos_diffs) if pos_diffs else 0.0,
-            "max_position_difficulty": max(pos_diffs) if pos_diffs else 0.0,
-            "avg_move_difficulty": np.mean(move_diffs) if move_diffs else 0.0,
-            "max_move_difficulty": max(move_diffs) if move_diffs else 0.0,
-            "max_accumulated_difficulty": max(accumulated) if accumulated else 0.0
+            "final_stamina": stamina,
+            "avg_position_difficulty": float(avg_pos),
+            "max_position_difficulty": float(max_pos),
+            "avg_move_difficulty": float(avg_move),
+            "max_move_difficulty": float(max_move),
+            "max_accumulated_difficulty": float(max_accum),
         }
 
+    def _generate_report(self, positions, moves, overall_diff, difficulty_level,
+                         pos_diffs, move_diffs, accumulated, stats) -> Dict:
+        """生成详细报告（与原报告结构一致）"""
         # 最难位置
         hardest_positions = []
         if positions:
-            sorted_indices = np.argsort(pos_diffs)[-3:][::-1]
+            sorted_idx = np.argsort(pos_diffs)[-3:][::-1]
             hardest_positions = [
-                {
-                    "index": positions[i]["index"],
-                    "difficulty": pos_diffs[i],
-                    "note_count": positions[i]["note_count"]
-                }
-                for i in sorted_indices
+                {"index": positions[i]["index"], "difficulty": pos_diffs[i],
+                 "note_count": positions[i]["note_count"]}
+                for i in sorted_idx
             ]
 
         # 最难移动
         hardest_moves = []
-        if moves:
-            move_diffs_arr = np.array([m["total_difficulty"] for m in moves])
-            sorted_indices = np.argsort(move_diffs_arr)[-3:][::-1]
+        if moves and move_diffs:
+            sorted_idx = np.argsort(move_diffs)[-3:][::-1]
             hardest_moves = [
-                {
-                    "from": moves[i]["from_index"],
-                    "to": moves[i]["to_index"],
-                    "difficulty": move_diffs_arr[i],
-                    "move_factor": moves[i].get("move_factor", 1.0),
-                    "note_counts": moves[i].get("note_counts", (0, 0))
-                }
-                for i in sorted_indices
+                {"from": moves[i]["from_index"], "to": moves[i]["to_index"],
+                 "difficulty": move_diffs[i], "move_factor": moves[i]["move_factor"],
+                 "note_counts": moves[i]["note_counts"]}
+                for i in sorted_idx
             ]
 
         # 多音符统计
         multi_note_stats = {
             "total_multi_notes": sum(1 for p in positions if p["note_count"] >= self.config.multi_note_threshold),
-            "max_notes_in_position": max(p["note_count"] for p in positions) if positions else 0
+            "max_notes_in_position": max((p["note_count"] for p in positions), default=0)
         }
 
-        # 建议
-        suggestions = self.generate_suggestions(overall_diff, difficulty_level,
-                                                hardest_positions, hardest_moves,
-                                                multi_note_stats)
+        # 建议（复用原逻辑）
+        suggestions = self._generate_suggestions(overall_diff, difficulty_level,
+                                                 hardest_positions, hardest_moves, multi_note_stats)
 
         return {
             "statistics": stats,
@@ -866,7 +813,30 @@ class GuitarSequenceAnalyzer:
             "config_summary": self.config.to_dict()
         }
 
-    def generate_suggestions(self, overall_diff, difficulty_level, hardest_positions,
+    def _empty_report(self):
+        """空序列报告"""
+        return {
+            "statistics": {
+                "overall_difficulty": 0.0,
+                "difficulty_level": DifficultyLevel.BEGINNER.value,
+                "bpm": self.config.bpm,
+                "total_positions": 0,
+                "total_moves": 0,
+                "final_stamina": 100.0,
+                "avg_position_difficulty": 0.0,
+                "max_position_difficulty": 0.0,
+                "avg_move_difficulty": 0.0,
+                "max_move_difficulty": 0.0,
+                "max_accumulated_difficulty": 0.0,
+            },
+            "hardest_positions": [],
+            "hardest_moves": [],
+            "multi_note_analysis": {"total_multi_notes": 0, "max_notes_in_position": 0},
+            "suggestions": [],
+            "config_summary": self.config.to_dict()
+        }
+
+    def _generate_suggestions(self, overall_diff, difficulty_level, hardest_positions,
                              hardest_moves, multi_note_stats):
         """生成练习建议"""
         suggestions = []

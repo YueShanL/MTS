@@ -252,6 +252,7 @@ class MTSGen2(PreTrainedModel):
     def generate(
         self,
         audio_input: Optional[torch.Tensor] = None,      # 新增：原始音频波形
+        encoder_outputs=None,
         max_length: int = 200,
         start_token_ids: Optional[torch.LongTensor] = None,
         do_sample: bool = True,
@@ -263,12 +264,14 @@ class MTSGen2(PreTrainedModel):
         - encoder_outputs: 预计算的编码器输出 [B, T, d_model]（若提供 audio_input 则可省略）
         - audio_input: 原始音频波形 [B, T_wave] 或 [B, 1, T_wave]
         """
-        if audio_input is None:
-            raise ValueError("必须提供 audio_input")
-        if audio_input is not None:
-            # 提取特征并计算编码器输出
-            features = self.extract_features(audio_input)            # [B, T, 440]
-            encoder_outputs = self.get_encoder_outputs(features)    # [B, T, d_model]
+        if encoder_outputs is None:
+            if audio_input is None:
+                raise ValueError("必须提供 audio_input")
+            else:
+                # 提取特征并计算编码器输出
+                features = self.extract_features(audio_input)  # [B, T, 440]
+                encoder_outputs = self.get_encoder_outputs(features)  # [B, T, d_model]
+
 
         # 后续生成逻辑与之前相同
         batch_size = encoder_outputs.size(0)
@@ -337,12 +340,12 @@ if __name__ == "__main__":
 
     if sr != 22050:
         resampler = torchaudio.transforms.Resample(sr, 22050)
-        wav = resampler(wav).mean(dim=0, keepdim=False)[:20*22050]
+        wav = resampler(wav).mean(dim=0, keepdim=False)[:120*22050]
 
     # 2. 生成（默认起始 token ID = 0）
     generated = model.generate(
         wav.to('cuda'),
-        max_length=80,
+        max_length=int(len(wav) / sr * 8),
     )
 
     fret, technique, duration = vmap(decode_token)(generated.to('cpu'))

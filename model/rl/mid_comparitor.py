@@ -1,121 +1,209 @@
-import pretty_midi
+from typing import Dict, Optional, Tuple
+
 import numpy as np
+import pretty_midi
+import torch
+import torch.nn.functional as F
 from dtw import dtw
 from scipy.spatial.distance import cosine
-import matplotlib.pyplot as plt
-from typing import Tuple, Dict, Optional, List
+from torch import jit
+
+from model.MTS2.utils import TimeProfiler
 
 
 class MidiVersionComparator:
     def __init__(self, time_resolution: float = 0.1,
                  feature_type: str = 'chroma',
-                 normalize_features: bool = True):
+                 normalize_features: bool = True,
+                 device: Optional[str] = None,
+                 enable_profiling: bool = False):  # ← 新增开关
         """
-        初始化比较器
-
-        参数:
-            time_resolution: 时间分辨率（秒），控制特征提取的精度
-            feature_type: 特征类型，可选 'chroma'(色谱), 'pianoroll'(钢琴卷), 'both'(两者结合)
-            normalize_features: 是否归一化特征
+        device: 'cuda' / 'cpu' / None (自动选择)
+        enable_profiling: 是否启用性能分析
         """
         self.time_resolution = time_resolution
         self.feature_type = feature_type
         self.normalize_features = normalize_features
+        self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.enable_profiling = enable_profiling
 
-        # 验证参数
+        if self.enable_profiling:
+            self.profiler = TimeProfiler()
+
         valid_features = ['chroma', 'pianoroll', 'both']
         if feature_type not in valid_features:
             raise ValueError(f"feature_type必须是 {valid_features} 之一")
 
-    def extract_features(self, pm: pretty_midi.PrettyMIDI) -> np.ndarray:
-        """
-        从PrettyMIDI对象提取特征矩阵
+    def extract_features(self, pm: pretty_midi.PrettyMIDI) -> torch.Tensor:
+        if self.enable_profiling:
+            self.profiler.start('extract_features')
 
-        返回:
-            (time_steps, feature_dim) 形状的特征矩阵
-        """
-        # 计算总时间步数
         total_time = pm.get_end_time()
         time_steps = int(np.ceil(total_time / self.time_resolution))
 
         if self.feature_type == 'chroma':
-            features = self._extract_chroma_features(pm, time_steps)
+            feat = self._extract_chroma_features(pm, time_steps)
         elif self.feature_type == 'pianoroll':
-            features = self._extract_pianoroll_features(pm, time_steps)
-        else:  # 'both'
+            feat = self._extract_pianoroll_features_gpu(pm, time_steps)
+        else:  # both
             chroma = self._extract_chroma_features(pm, time_steps)
-            pianoroll = self._extract_pianoroll_features(pm, time_steps)
-            # 合并特征
-            features = np.concatenate([chroma, pianoroll], axis=1)
+            pianoroll = self._extract_pianoroll_features_gpu(pm, time_steps)
+            feat = torch.cat([chroma, pianoroll], dim=1)
 
-        # 归一化
         if self.normalize_features:
-            features = (features - np.mean(features)) / (np.std(features) + 1e-8)
+            mean = feat.mean(dim=0, keepdim=True)
+            std = feat.std(dim=0, keepdim=True)
+            feat = (feat - mean) / (std + 1e-8)
 
-        return features
+        if self.enable_profiling:
+            self.profiler.stop('extract_features')
+        return feat
 
     def _extract_chroma_features(self, pm: pretty_midi.PrettyMIDI,
-                                 time_steps: int) -> np.ndarray:
-        """提取色谱特征"""
-        # 获取色谱图，转置为 (时间帧, 12)
+                                 time_steps: int) -> torch.Tensor:
+        # CPU 计算，结果转 GPU
         chroma = pm.get_chroma(fs=int(1 / self.time_resolution))
-        features = chroma.T[:time_steps]
+        chroma = chroma.T[:time_steps]
+        if chroma.shape[0] < time_steps:
+            pad = np.zeros((time_steps - chroma.shape[0], 12))
+            chroma = np.vstack([chroma, pad])
+        return torch.from_numpy(chroma).float().to(self.device)
 
-        # 确保维度一致
-        if features.shape[0] < time_steps:
-            padding = np.zeros((time_steps - features.shape[0], 12))
-            features = np.vstack([features, padding])
+    def _extract_pianoroll_features_gpu(self, pm: pretty_midi.PrettyMIDI,
+                                        time_steps: int) -> torch.Tensor:
+        if self.enable_profiling:
+            self.profiler.start('build_pianoroll')
 
-        return features
-
-    def _extract_pianoroll_features(self, pm: pretty_midi.PrettyMIDI,
-                                    time_steps: int) -> np.ndarray:
-        """提取钢琴卷特征"""
-        feature_dim = 128
-        features = np.zeros((time_steps, feature_dim))
-
-        for instrument in pm.instruments:
-            for note in instrument.notes:
+        feat = torch.zeros(time_steps, 128, device=self.device)
+        for instr in pm.instruments:
+            notes_data = []
+            for note in instr.notes:
                 start_step = int(note.start / self.time_resolution)
                 end_step = int(note.end / self.time_resolution)
+                if start_step >= time_steps:
+                    continue
+                end_step = min(end_step, time_steps)
+                notes_data.append((start_step, end_step, note.pitch, note.velocity / 127.0))
 
-                if start_step < time_steps:
-                    end_idx = min(end_step, time_steps)
-                    # 使用力度作为特征值，归一化到[0,1]
-                    features[start_step:end_idx, note.pitch] = np.maximum(
-                        features[start_step:end_idx, note.pitch],
-                        note.velocity / 127.0
-                    )
+            if not notes_data:
+                continue
 
-        return features
+            starts = torch.tensor([d[0] for d in notes_data], device=self.device)
+            ends = torch.tensor([d[1] for d in notes_data], device=self.device)
+            pitches = torch.tensor([d[2] for d in notes_data], device=self.device)
+            velocities = torch.tensor([d[3] for d in notes_data], device=self.device)
 
-    def evaluate(self, pm1: pretty_midi.PrettyMIDI,
-                pm2: pretty_midi.PrettyMIDI,
-                use_dtw: bool = True):
-        return self.compare(pm1, pm2, use_dtw)['avg_cosine_similarity']
+            for start, end, pitch, vel in zip(starts, ends, pitches, velocities):
+                feat[start:end, pitch] = torch.maximum(feat[start:end, pitch], vel)
+
+        if self.enable_profiling:
+            self.profiler.stop('build_pianoroll')
+        return feat
+
+    def _cosine_distance_matrix(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+        if self.enable_profiling:
+            self.profiler.start('cosine_dist_mat')
+
+        Xn = F.normalize(X, p=2, dim=1)
+        Yn = F.normalize(Y, p=2, dim=1)
+        sim = Xn @ Yn.T
+        dist = 1 - sim
+        dist = torch.clamp(dist, 0, 2)
+
+        # 处理零向量
+        zero_mask_X = (X.norm(dim=1) == 0)
+        zero_mask_Y = (Y.norm(dim=1) == 0)
+        if zero_mask_X.any() or zero_mask_Y.any():
+            dist[zero_mask_X, :] = 1.0
+            dist[:, zero_mask_Y] = 1.0
+            dist[zero_mask_X][:, zero_mask_Y] = 0.0
+
+        if self.enable_profiling:
+            self.profiler.stop('cosine_dist_mat')
+        return dist
+
+    def _dtw_gpu(self, X: torch.Tensor, Y: torch.Tensor) -> Tuple[
+        float, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.enable_profiling:
+            self.profiler.start('dtw_dp')
+
+        D = self._cosine_distance_matrix(X, Y)
+        N, M = D.shape
+        C = torch.full((N + 1, M + 1), float('inf'), device=self.device)
+        C[0, 0] = 0.0
+
+        for i in range(1, N + 1):
+            for j in range(1, M + 1):
+                min_prev = torch.min(C[i - 1, j], C[i, j - 1])
+                min_prev = torch.min(min_prev, C[i - 1, j - 1])
+                C[i, j] = D[i - 1, j - 1] + min_prev
+
+        # 回溯
+        path_x, path_y = [], []
+        i, j = N, M
+        while i > 0 and j > 0:
+            path_x.append(i - 1)
+            path_y.append(j - 1)
+            if i == 1 and j == 1:
+                break
+            prev = torch.tensor([C[i - 1, j], C[i, j - 1], C[i - 1, j - 1]], device=self.device)
+            min_idx = torch.argmin(prev)
+            if min_idx == 0:
+                i -= 1
+            elif min_idx == 1:
+                j -= 1
+            else:
+                i -= 1
+                j -= 1
+        path_x.reverse()
+        path_y.reverse()
+        path_x = torch.tensor(path_x, device=self.device)
+        path_y = torch.tensor(path_y, device=self.device)
+
+        if self.enable_profiling:
+            self.profiler.stop('dtw_dp')
+        return C[N, M].item(), C, (path_x, path_y)
 
     def compare(self, pm1: pretty_midi.PrettyMIDI,
                 pm2: pretty_midi.PrettyMIDI,
                 use_dtw: bool = True) -> Dict:
-        """
-        比较两个PrettyMIDI对象
+        if self.enable_profiling:
+            self.profiler.start('total_compare')
 
-        参数:
-            pm1, pm2: PrettyMIDI对象
-            use_dtw: 是否使用DTW对齐（True）或直接比较（False）
-
-        返回:
-            包含比较结果的字典
-        """
-        # 提取特征
         X = self.extract_features(pm1)
         Y = self.extract_features(pm2)
 
         if use_dtw:
+            X = X.cpu().numpy()
+            Y = Y.cpu().numpy()
             return self._compare_with_dtw(X, Y, pm1, pm2)
         else:
-            return self._compare_directly(X, Y, pm1, pm2)
+            #if len(X) != len(Y):
+                #print(f'X({len(X)}) and Y({len(Y)}) are not the same length')
+            min_len = min(len(X), len(Y))
+            Xt = X[:min_len]
+            Yt = Y[:min_len]
+            dists = self._cosine_distance_matrix(Xt, Yt).diag()
+            sims = 1 - dists
+            avg_sim = sims.mean().item()
+            norm_dist = None
+            path_len = min_len
+            method = 'direct_cosine'
 
+        basic_info = self._extract_basic_info(pm1, pm2)
+
+        if self.enable_profiling:
+            self.profiler.stop('total_compare')
+            self.profiler.report(step='compare')
+
+        return {
+            **basic_info,
+            'normalized_distance': norm_dist,
+            'avg_cosine_similarity': avg_sim,
+            'similarity_std': sims.std().item() if len(sims) > 0 else 0,
+            'path_length': path_len,
+            'method': method,
+        }
     def _compare_with_dtw(self, X: np.ndarray, Y: np.ndarray,
                           pm1: pretty_midi.PrettyMIDI,
                           pm2: pretty_midi.PrettyMIDI) -> Dict:
@@ -162,50 +250,22 @@ class MidiVersionComparator:
             'feature_matrices': (X, Y),
             'method': 'dtw_cosine'
         }
-
-    def _compare_directly(self, X: np.ndarray, Y: np.ndarray,
-                          pm1: pretty_midi.PrettyMIDI,
-                          pm2: pretty_midi.PrettyMIDI) -> Dict:
-        """直接比较特征（无时间对齐）"""
-        # 将较长的序列截断或填充到与较短的序列相同长度
-        min_len = min(len(X), len(Y))
-        X_trunc = X[:min_len]
-        Y_trunc = Y[:min_len]
-
-        # 计算逐帧余弦相似度
-        similarities = []
-        for i in range(min_len):
-            if not (np.all(X_trunc[i] == 0) and np.all(Y_trunc[i] == 0)):
-                sim = 1 - cosine(X_trunc[i], Y_trunc[i])
-                similarities.append(sim)
-
-        avg_similarity = np.mean(similarities) if similarities else 0
-
-        basic_info = self._extract_basic_info(pm1, pm2)
-
-        return {
-            **basic_info,
-            'avg_cosine_similarity': avg_similarity,
-            'similarity_std': np.std(similarities) if similarities else 0,
-            'frame_count': min_len,
-            'method': 'direct_cosine'
-        }
+    def evaluate(self, pm1: pretty_midi.PrettyMIDI,
+        pm2: pretty_midi.PrettyMIDI,
+        use_dtw: bool = True):
+        return self.compare(pm1, pm2, use_dtw)['avg_cosine_similarity']
 
     def _extract_basic_info(self, pm1: pretty_midi.PrettyMIDI,
                             pm2: pretty_midi.PrettyMIDI) -> Dict:
-        """提取MIDI文件基本信息"""
+        """提取 MIDI 基本信息（与原类相同）"""
 
         def get_notes_info(pm):
             note_count = sum(len(instr.notes) for instr in pm.instruments)
-            pitches = [note.pitch for instr in pm.instruments
-                       for note in instr.notes]
-            durations = [note.end - note.start for instr in pm.instruments
-                         for note in instr.notes]
-
+            pitches = [note.pitch for instr in pm.instruments for note in instr.notes]
+            durations = [note.end - note.start for instr in pm.instruments for note in instr.notes]
             return {
                 'note_count': note_count,
-                'pitch_range': (min(pitches) if pitches else 0,
-                                max(pitches) if pitches else 0),
+                'pitch_range': (min(pitches) if pitches else 0, max(pitches) if pitches else 0),
                 'avg_duration': np.mean(durations) if durations else 0,
                 'duration_std': np.std(durations) if durations else 0,
                 'instruments': len(pm.instruments)
@@ -213,136 +273,61 @@ class MidiVersionComparator:
 
         info1 = get_notes_info(pm1)
         info2 = get_notes_info(pm2)
-
         return {
-            'duration_ratio': pm2.get_end_time() / pm1.get_end_time()
-            if pm1.get_end_time() > 0 else 0,
-            'note_count_ratio': info2['note_count'] / info1['note_count']
-            if info1['note_count'] > 0 else 0,
+            'duration_ratio': pm2.get_end_time() / pm1.get_end_time() if pm1.get_end_time() > 0 else 0,
+            'note_count_ratio': info2['note_count'] / info1['note_count'] if info1['note_count'] > 0 else 0,
             'info1': info1,
             'info2': info2
         }
 
-    def visualize_comparison(self, pm1: pretty_midi.PrettyMIDI,
-                             pm2: pretty_midi.PrettyMIDI,
-                             save_path: Optional[str] = None) -> Dict:
-        """
-        Visualize the comparison results
 
-        Returns:
-            Comparison result dictionary
-        """
-        result = self.compare(pm1, pm2, use_dtw=True)
-        X, Y = result['feature_matrices']
-        path_x, path_y = result['alignment_path']
+@jit.script
+def dtw_core(D: torch.Tensor) -> Tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    GPU 加速的 DTW 核心
+    Args:
+        D: 距离矩阵 (N, M)
+    Returns:
+        min_distance, 累积成本矩阵, 路径 x, 路径 y
+    """
+    N, M = D.shape
+    C = torch.full((N + 1, M + 1), float('inf'), dtype=D.dtype, device=D.device)
+    C[0, 0] = 0.0
 
-        fig = plt.figure(figsize=(15, 10))
+    # 关键：这个双层循环在 TorchScript 中会被编译为高效的 CUDA 代码
+    for i in range(1, N + 1):
+        for j in range(1, M + 1):
+            min_prev = torch.min(C[i - 1, j], C[i, j - 1])
+            min_prev = torch.min(min_prev, C[i - 1, j - 1])
+            C[i, j] = D[i - 1, j - 1] + min_prev
 
-        # 1. Feature Matrix Visualization
-        ax1 = plt.subplot(2, 3, 1)
-        im1 = ax1.imshow(X.T, aspect='auto', origin='lower',
-                         cmap='Reds', interpolation='nearest')
-        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-
-        ax2 = plt.subplot(2, 3, 2)
-        im2 = ax2.imshow(Y.T, aspect='auto', origin='lower',
-                         cmap='Blues', interpolation='nearest')
-        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-
-        # 2. DTW Alignment Path
-        ax3 = plt.subplot(2, 3, 3)
-        ax3.plot(path_x, path_y, 'k-', alpha=0.3, linewidth=0.5)
-
-        # Color path points based on similarity
-        similarities = []
-        for i, j in zip(path_x, path_y):
-            if i < len(X) and j < len(Y):
-                sim = 1 - cosine(X[i], Y[j]) if not (np.all(X[i] == 0) and np.all(Y[j] == 0)) else 0
-                similarities.append(sim)
-
-        if similarities:
-            sc = ax3.scatter(path_x[:len(similarities)],
-                             path_y[:len(similarities)],
-                             c=similarities, s=1, cmap='RdYlGn',
-                             vmin=0, vmax=1)
-            plt.colorbar(sc, ax=ax3, label='Frame Similarity')
-
-        ax3.grid(True, alpha=0.3)
-
-        # 3. Similarity Distribution
-        ax4 = plt.subplot(2, 3, 4)
-        if similarities:
-            ax4.hist(similarities, bins=30, alpha=0.7, color='green',
-                     edgecolor='black')
-            ax4.axvline(result['avg_cosine_similarity'], color='red',
-                        linestyle='--', linewidth=2,
-                        label=f'Average={result["avg_cosine_similarity"]:.3f}')
-            ax4.set_title('Similarity Distribution')
-            ax4.set_xlabel('Cosine Similarity')
-            ax4.set_ylabel('Frequency')
-            ax4.legend()
-            ax4.grid(True, alpha=0.3)
-
-        # 4. Basic Information Table
-        ax5 = plt.subplot(2, 3, 5)
-        ax5.axis('tight')
-        ax5.axis('off')
-
-        info_text = (
-            f"Comparison Results:\n"
-            f"Method: {result['method']}\n"
-            f"Avg Cosine Similarity: {result['avg_cosine_similarity']:.3f}\n"
-            f"Similarity Std: {result['similarity_std']:.3f}\n"
-            f"DTW Normalized Distance: {result['normalized_distance']:.3f}\n"
-            f"Alignment Path Length: {result['path_length']}\n"
-            f"Duration Ratio: {result['duration_ratio']:.2f}\n"
-            f"Note Count Ratio: {result['note_count_ratio']:.2f}"
-        )
-        ax5.text(0.1, 0.5, info_text, fontsize=10,
-                 verticalalignment='center', fontfamily='monospace')
-
-        # 5. Note Statistics Comparison
-        ax6 = plt.subplot(2, 3, 6)
-        categories = ['Note Count', 'Pitch Range', 'Average Duration']
-        values1 = [
-            result['info1']['note_count'],
-            result['info1']['pitch_range'][1] - result['info1']['pitch_range'][0],
-            result['info1']['avg_duration']
-        ]
-        values2 = [
-            result['info2']['note_count'],
-            result['info2']['pitch_range'][1] - result['info2']['pitch_range'][0],
-            result['info2']['avg_duration']
-        ]
-
-        x = np.arange(len(categories))
-        width = 0.35
-
-        ax6.bar(x - width / 2, values1, width, label='Version 1', alpha=0.8)
-        ax6.bar(x + width / 2, values2, width, label='Version 2', alpha=0.8)
-
-        ax6.set_xticks(x)
-        ax6.set_xticklabels(categories)
-        ax6.legend()
-        ax6.grid(True, alpha=0.3, axis='y')
-
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Visualization results saved to: {save_path}")
-
-        ax1.set_title(f'Version1 Features\n{X.shape}')
-        ax2.set_title(f'Version2 Features\n{Y.shape}')
-        ax3.set_title('DTW Alignment Path')
-        ax6.set_xlabel('Metric')
-        ax6.set_ylabel('Value')
-        ax6.set_title('Basic Statistics Comparison')
-        plt.suptitle('MIDI Arrangement Version Comparison')
-
-        plt.show()
-
-        return result
+    # 回溯路径（同样在 GPU 上高效执行）
+    max_len = N + M
+    path_x = torch.empty(max_len, dtype=torch.long, device=D.device)
+    path_y = torch.empty(max_len, dtype=torch.long, device=D.device)
+    i, j = N, M
+    idx = 0
+    while i > 0 and j > 0:
+        path_x[idx] = i - 1
+        path_y[idx] = j - 1
+        idx += 1
+        if i == 1 and j == 1:
+            break
+        # 选择最小前驱
+        up = C[i - 1, j]
+        left = C[i, j - 1]
+        diag = C[i - 1, j - 1]
+        if up <= left and up <= diag:
+            i -= 1
+        elif left <= up and left <= diag:
+            j -= 1
+        else:
+            i -= 1
+            j -= 1
+    # 反转路径
+    path_x = path_x[:idx].flip(0)
+    path_y = path_y[:idx].flip(0)
+    return C[N, M].item(), C, path_x, path_y
 
 def midi_to_pretty_midi(mido_midi, byte=False):
     """
