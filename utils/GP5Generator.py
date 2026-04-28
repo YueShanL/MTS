@@ -90,7 +90,7 @@ class GuitarProGenerator:
     def add_note(self, song: gp.Song, string: int, fret: int,
                  new_duration, technique: GuitarTechnique = GuitarTechnique.NORMAL,
                  position=-1,
-                 track_index: int = 0, measure_index: int = -1, replace_existing=False) -> bool:
+                 track_index: int = 0, measure_index: int = -1, replace_existing=False, velocity = 127) -> bool:
 
         duration = None
         if isinstance(new_duration, str):
@@ -127,6 +127,7 @@ class GuitarProGenerator:
         target_start = 0
         assert position < 4
         note = Note(None)
+        note.velocity = velocity
         note.string = string
         note.value = fret
         note.type = NoteType.normal
@@ -162,6 +163,7 @@ class GuitarProGenerator:
             # 创建拍子
             #print(f'failed to add note on position {position}, adding new note at {target_start}')
             beat = Beat(voice)
+
             beat.duration = duration  # 使用Duration对象
             if position == -1:
                 target_start = voice.beats[-1].startInMeasure + voice.beats[-1].duration.time
