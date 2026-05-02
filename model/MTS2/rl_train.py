@@ -29,8 +29,12 @@ class MTSReward:
                  difficulty_system = GuitarSequenceAnalyzer(PresetConfigs.get_default()),
                  similarity_system = MidiVersionComparator(),
                  config = RLConfig(),
-                 num_worker = 16
+                 num_worker = 16,
+                 similarity_weight = 1.0,
+                 difficulty_weight = 1.0,
                  ):
+        self.similarity_weight = similarity_weight
+        self.difficulty_weight = difficulty_weight
         self.difficulty_system = difficulty_system
         self.similarity_system = similarity_system
         self.config = config
@@ -130,7 +134,7 @@ class MTSReward:
         if self.debug:
             self.profiler.start('difficulty')
         # 1. 难度奖励
-        difficulty_reward = self.difficulty_system.evaluate(song)
+        difficulty_reward = self.difficulty_system.evaluate(song) * self.difficulty_weight
         rewards["difficulty"] = float(difficulty_reward)
         if self.debug:
             self.profiler.stop('difficulty')
@@ -151,7 +155,7 @@ class MTSReward:
                 self.profiler.stop('transcript')
 
             if source_has_notes and target_has_notes:
-                similarity_reward = self.similarity_system.evaluate(generated_midi, target_midi, False)
+                similarity_reward = self.similarity_system.evaluate(generated_midi, target_midi, False) * self.similarity_weight
             elif not source_has_notes and not target_has_notes:
                 similarity_reward = 1.0
             else:
