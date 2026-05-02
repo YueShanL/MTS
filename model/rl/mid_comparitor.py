@@ -8,7 +8,7 @@ from dtw import dtw
 from scipy.spatial.distance import cosine
 from torch import jit
 
-from model.MTS2.utils import TimeProfiler
+from model.MTS2.profiler import TimeProfiler
 
 
 class MidiVersionComparator:
@@ -83,7 +83,7 @@ class MidiVersionComparator:
                 if start_step >= time_steps:
                     continue
                 end_step = min(end_step, time_steps)
-                notes_data.append((start_step, end_step, note.pitch, note.velocity / 127.0))
+                notes_data.append((start_step, end_step, note.pitch, note.velocity_logits / 127.0))
 
             if not notes_data:
                 continue
