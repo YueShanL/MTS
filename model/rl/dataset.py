@@ -303,7 +303,7 @@ def extract_segment(midi: pretty_midi.PrettyMIDI,
 
             if overlap_start < overlap_end:
                 new_note = pretty_midi.Note(
-                    velocity=note.velocity,
+                    velocity=note.velocity_logits,
                     pitch=note.pitch,
                     start=overlap_start - start_time,
                     end=overlap_end - start_time

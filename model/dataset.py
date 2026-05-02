@@ -542,8 +542,8 @@ def decode(tab_sequence:Dict, tempo: int = 120, post_process=True):
                 position = (idx % 16) / 4
                 if fret != 25:
                     v = 127
-                    if tab_sequence.get('velocity') is not None:
-                        v = tab_sequence['velocity'][idx][string] * v
+                    if tab_sequence.get('velocity_tokens') is not None:
+                        v = tab_sequence['velocity_tokens'][idx][string]
                     f = fret.tolist() if isinstance(fret, Tensor) else fret
                     t = tab_sequence['technique'][idx][string]
                     t = t.tolist() if isinstance(t, Tensor) else t

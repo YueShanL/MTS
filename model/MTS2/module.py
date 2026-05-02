@@ -35,9 +35,11 @@ class MTSGen2Config(PretrainedConfig):
         vocab_size: int = 4732,          # 每个头的词汇表大小
         num_heads: int = 6,              # 新增：输出头数量
         decoder_start_token_id: int = 0,
+        velocity_vocab_size = 128,
         **kwargs
     ):
         super().__init__(**kwargs)
+        self.velocity_vocab_size = velocity_vocab_size
         self.freeze_basic_pitch = freeze_basic_pitch
         self.sample_rate = sample_rate
         self.fft_hop = fft_hop
@@ -383,11 +385,8 @@ class MTSGen2v2(PreTrainedModel):
             nn.Linear(config.d_model, config.vocab_size) for _ in range(config.num_heads)
         ])
 
-        #力度输出头：线性层 + Sigmoid，输出 num_heads 个值，每个 ∈(0,1)
-        self.velocity_head = nn.Sequential(
-            nn.Linear(config.d_model, config.num_heads),
-            nn.Sigmoid()
-        )
+        # MIDI 力度 0-127，共 128 类
+        self.velocity_head = nn.Linear(config.d_model, config.num_heads * config.velocity_vocab_size)
 
         # ---------- 初始化权重 ----------
         self.post_init()
@@ -467,7 +466,8 @@ class MTSGen2v2(PreTrainedModel):
 
         if not return_dict:
             return (loss, logits) + ((new_past,) if use_cache else ())
-        velocity = self.velocity_head(hidden_states)  # [B, seq_len, num_heads]
+        velocity_logits = self.velocity_head(hidden_states)  # [B, L, num_heads * 128]
+        velocity_logits = velocity_logits.view(hidden_states.size(0), hidden_states.size(1), self.config.num_heads, -1)
 
         loss = None
         if labels is not None:
@@ -481,7 +481,7 @@ class MTSGen2v2(PreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=new_past,
-            velocity=velocity,
+            velocity_logits=velocity_logits,
         )
 
 
@@ -525,33 +525,33 @@ class MTSGen2v2(PreTrainedModel):
         return features
 
     def generate(
-        self,
-        audio_input: Optional[torch.Tensor] = None,      # 新增：原始音频波形
-        encoder_outputs=None,
-        max_length: int = 200,
-        start_token_ids: Optional[torch.LongTensor] = None,
-        do_sample: bool = True,
-        temperature: float = 1.0,
-        **kwargs
+            self,
+            audio_input: Optional[torch.Tensor] = None,
+            encoder_outputs=None,
+            max_length: int = 200,
+            start_token_ids: Optional[torch.LongTensor] = None,
+            velocity_start_token_id: int = 0,  # 🆕 力度起始 token
+            do_sample: bool = True,
+            temperature: float = 1.0,
+            **kwargs
     ):
         """
-        生成多轨道 token 序列。
+        生成多轨道 token 序列和 velocity token 序列。
         - encoder_outputs: 预计算的编码器输出 [B, T, d_model]（若提供 audio_input 则可省略）
         - audio_input: 原始音频波形 [B, T_wave] 或 [B, 1, T_wave]
+        - velocity_start_token_id: 力度序列的起始 token (默认 0，对应 MIDI 力度 0)
         """
+        # ---------- 1. 计算编码器输出 ----------
         if encoder_outputs is None:
             if audio_input is None:
-                raise ValueError("必须提供 audio_input")
-            else:
-                # 提取特征并计算编码器输出
-                features = self.extract_features(audio_input)  # [B, T, 440]
-                encoder_outputs = self.get_encoder_outputs(features)  # [B, T, d_model]
+                raise ValueError("必须提供 audio_input 或 encoder_outputs")
+            features = self.extract_features(audio_input)  # [B, T, 264]
+            encoder_outputs = self.get_encoder_outputs(features)  # [B, T, d_model]
 
-
-        # 后续生成逻辑与之前相同
         batch_size = encoder_outputs.size(0)
         device = encoder_outputs.device
 
+        # ---------- 2. 初始化 token 序列 ----------
         if start_token_ids is None:
             start_token_ids = torch.full(
                 (batch_size, self.config.num_heads),
@@ -560,19 +560,32 @@ class MTSGen2v2(PreTrainedModel):
                 device=device
             )
         generated = start_token_ids.unsqueeze(1)  # [B, 1, num_heads]
-        velocity_generated = torch.zeros(batch_size, 1, self.config.num_heads, device=device)
+
+        # ---------- 3. 初始化 velocity token 序列 ----------
+        velocity_generated = torch.full(
+            (batch_size, 1, self.config.num_heads),
+            velocity_start_token_id,
+            dtype=torch.long,
+            device=device
+        )  # [B, 1, num_heads]
 
         past_key_values = None
+
+        # ---------- 4. 自回归生成循环 ----------
         for step in range(max_length - 1):
+            # 准备模型输入（只传最后一个时间步，利用 KV 缓存）
             model_inputs = self.prepare_inputs_for_generation(
-                input_ids=generated,
+                input_ids=generated[:, -1:, :],  # [B, 1, num_heads]
                 past_key_values=past_key_values,
                 encoder_outputs=encoder_outputs,
             )
-            outputs = self(**model_inputs)
-            logits = outputs.logits          # [B, 1, num_heads, vocab_size]
-            velocity_step = outputs.velocity  # [B, 1, num_heads]
 
+            # 前向传播
+            outputs = self(**model_inputs)
+            logits = outputs.logits  # [B, 1, num_heads, vocab_size]
+            velocity_logits = outputs.velocity_logits  # [B, 1, num_heads, velocity_vocab_size]
+
+            # ---------- 采样 6 个轨道的下一个 token ----------
             next_tokens = []
             for head_idx in range(self.config.num_heads):
                 head_logits = logits[:, :, head_idx, :].squeeze(1)  # [B, vocab_size]
@@ -584,13 +597,31 @@ class MTSGen2v2(PreTrainedModel):
                     next_token = torch.argmax(head_logits, dim=-1, keepdim=True)
                 next_tokens.append(next_token)
             next_tokens = torch.cat(next_tokens, dim=-1).unsqueeze(1)  # [B, 1, num_heads]
-            velocity_generated = torch.cat([velocity_generated, velocity_step], dim=1)
-            generated = torch.cat([generated, next_tokens], dim=1)
+
+            # ---------- 采样 6 个轨道的下一个 velocity token ----------
+            next_velocities = []
+            for head_idx in range(self.config.num_heads):
+                v_logits = velocity_logits[:, :, head_idx, :].squeeze(1)  # [B, velocity_vocab_size]
+                if do_sample:
+                    v_logits = v_logits / temperature
+                    probs = F.softmax(v_logits, dim=-1)
+                    v_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    v_token = torch.argmax(v_logits, dim=-1, keepdim=True)
+                next_velocities.append(v_token)
+            next_velocities = torch.cat(next_velocities, dim=-1).unsqueeze(1)  # [B, 1, num_heads]
+
+            # 拼接到序列
+            generated = torch.cat([generated, next_tokens], dim=1)  # [B, L, num_heads]
+            velocity_generated = torch.cat([velocity_generated, next_velocities], dim=1)  # [B, L, num_heads]
+
+            # 更新缓存
             past_key_values = outputs.past_key_values
 
+        # ---------- 5. 返回字典（训练器会将此字典传给 compute_log_probs_with_velocity）----------
         return {
-            "token_ids": generated,  # [B, seq_len, num_heads]
-            "velocity": velocity_generated  # [B, seq_len, num_heads] 值域 0~1
+            "token_ids": generated,  # [B, max_length, num_heads]
+            "velocity_tokens": velocity_generated  # [B, max_length, num_heads] 值域 0 ~ velocity_vocab_size-1
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
@@ -608,7 +639,7 @@ class MTSGen2v2(PreTrainedModel):
         return mask
 @dataclass
 class MTSGen2OutputWithVelocity(CausalLMOutputWithPast):
-    velocity: Optional[torch.FloatTensor] = None   # [B, seq_len, num_heads]
+    velocity_logits: Optional[torch.FloatTensor] = None   # [B, seq_len, num_heads, vocab_size]
 
 def testGen2():
     model = MTSGen2.from_pretrained('../../output/Model/mts2/best').to('cuda')
@@ -658,7 +689,7 @@ def testGen2v2():
     )
 
     fret, technique, duration = vmap(decode_token)(generated['token_ids'].to('cpu'))
-    velocity = generated['velocity']
+    velocity = generated['velocity_tokens']
     duration = duration.to(float).mean(dim=2, keepdim=False).to(int)
 
     song = decode({'fret': fret.squeeze(), 'technique': technique.squeeze(), 'duration': duration.squeeze(), 'velocity': velocity.squeeze().cpu()})
