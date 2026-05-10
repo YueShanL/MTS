@@ -95,7 +95,7 @@ class MTSReward:
             row = []
             for b in range(B):
                 r = self._calculate_reward(
-                    generated_sequence=generated_sequence[g*b],
+                    generated_sequence=generated_sequence[g*B+b],
                     target_midi=target_midi[b]
                 )
                 row.append(float(r))
@@ -115,9 +115,9 @@ class MTSReward:
             row = []
             for b in range(B):
                 r = self._calculate_reward(
-                    generated_sequence=token_ids[g*b],
+                    generated_sequence=token_ids[g*B + b],
                     target_midi=target_midi[b],
-                    velocity_tokens=velocity[g*b]
+                    velocity_tokens=velocity[g*B + b]
                 )
                 row.append(float(r))
             rewards_list.append(row)
