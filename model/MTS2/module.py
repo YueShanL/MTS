@@ -9,6 +9,7 @@ from torch import vmap
 from transformers import PreTrainedModel, PretrainedConfig, T5Config
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.t5.modeling_t5 import T5Stack
+from torch.distributions import Categorical
 
 import basic_pitch_torch.constants
 from basic_pitch_torch.model import BasicPitchTorch
@@ -591,8 +592,8 @@ class MTSGen2v2(PreTrainedModel):
                 head_logits = logits[:, :, head_idx, :].squeeze(1)  # [B, vocab_size]
                 if do_sample:
                     head_logits = head_logits / temperature
-                    probs = F.softmax(head_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
+                    dist = Categorical(logits=head_logits)
+                    next_token = dist.sample().unsqueeze(-1)
                 else:
                     next_token = torch.argmax(head_logits, dim=-1, keepdim=True)
                 next_tokens.append(next_token)
@@ -604,8 +605,8 @@ class MTSGen2v2(PreTrainedModel):
                 v_logits = velocity_logits[:, :, head_idx, :].squeeze(1)  # [B, velocity_vocab_size]
                 if do_sample:
                     v_logits = v_logits / temperature
-                    probs = F.softmax(v_logits, dim=-1)
-                    v_token = torch.multinomial(probs, num_samples=1)
+                    v_dist = Categorical(logits=v_logits)
+                    v_token = v_dist.sample().unsqueeze(-1)
                 else:
                     v_token = torch.argmax(v_logits, dim=-1, keepdim=True)
                 next_velocities.append(v_token)

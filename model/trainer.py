@@ -437,8 +437,8 @@ def train_mixed_model(model, train_dataset, val_dataset=None,
                 torch.save(model.state_dict(), f'{file_dir}/checkpoint_epoch{epoch}.pth')
                 if all_batch_losses:
                     _generate_loss_plot(all_batch_losses, f'{file_dir}')
-                _generate_sample(model, train_dataset[random.randint(0, len(train_dataset) - 1)], f'{file_dir}/train')
-                _generate_sample(model, val_dataset[random.randint(0, len(val_dataset) - 1)], f'{file_dir}/eval')
+                _generate_sample(model, get_random_sample(train_dataset, epoches_len * batch_size - 1), f'{file_dir}/train')
+                _generate_sample(model, get_random_sample(val_dataset, batch_size), f'{file_dir}/eval')
 
 
         # 记录日志

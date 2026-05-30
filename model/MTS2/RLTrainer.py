@@ -256,6 +256,14 @@ class GRPOTrainer(Trainer):
         if self.debug:
             self.time_profiler.stop('log_prob')
 
+        if self.accelerator.is_main_process:
+            self.log({
+                "reward_mean": rewards_list.mean().item(),
+                "reward_std": rewards_list.std().item(),
+                "reward_max": rewards_list.max().item(),
+                "reward_min": rewards_list.min().item(),
+            })
+
         # =========================
         # 6. PPO
         # =========================
@@ -293,6 +301,16 @@ class GRPOTrainer(Trainer):
             kl_loss = torch.tensor(0.0, device=device)
 
         loss = policy_loss + self.kl_coef * kl_loss
+
+        if self.accelerator.is_main_process:
+            self.log({
+                "old_log_prob": old_log_probs.mean().item(),
+                "new_log_prob": new_log_probs.mean().item(),
+                "ratio": ratio.mean().item(),
+                "policy_loss": policy_loss.item(),
+                "kl_loss": kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+                "total_loss": loss.item(),
+            })
 
         self.accelerator.backward(loss)
         if self.debug:
